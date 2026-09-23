@@ -65,6 +65,31 @@ Run the locked compatibility probe on the remote GPU runner with:
 uv run --locked python scripts/verify_compatibility.py
 ```
 
+An explicitly approved egress diagnostic can use
+`--reviewed-egress-experiment`. It adds only `www.gstatic.com:443` and
+`update.googleapis.com:443` to that probe's in-process SOCKS policy. The
+exception is exact-host only, expires no later than 60 minutes after proxy
+creation, and ends earlier when the probe exits. The probe itself has a
+110-second deadline; the bounded Vast invocation stops it after 120 seconds.
+This does not change the runner's network firewall or the normal capture
+proxy: `capture_worker.py` never enables the experiment. Its result is marked
+diagnostic-only and cannot authorize capture or issue a `gpu_check_id`. Do not
+add hosts through command-line values or configuration.
+
+The proxy records a bounded summary of destination hostname, port, and
+connection outcome. It does not inspect tunneled payloads, collect URL paths or
+HTTP methods, or observe request initiators. HTTPS metadata would require TLS
+interception, which is outside this diagnostic. It does not collect raw NetLog
+data; keep path-based attributions separate and qualified.
+
+The approved diagnostic ran once on 2026-09-23. Both candidate hosts connected,
+but CPU compatibility remained blocked by other destinations, including
+`clients2.google.com`, `www.google.com`, `accounts.google.com`,
+`android.clients.google.com`, `edgedl.me.gvt1.com`, and `dl.google.com`. GPU and
+hardware-backed WebGL passed. The probe remained diagnostic-only, issued no
+`gpu_check_id`, and did not change the ordinary proxy policy. See the [egress
+proposal and result](../../agent-infrastructure/knowledge/browser-use-capture-egress-proposal.md).
+
 The probe must explicitly launch Chrome, wait for its loopback CDP endpoint,
 and attach `BrowserSession` to that session. It must verify page evaluation,
 desktop/mobile viewport control, reduced-motion emulation, jank instrumentation,

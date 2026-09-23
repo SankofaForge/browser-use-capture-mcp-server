@@ -331,11 +331,14 @@ class VastRunner:
                 return payload
         raise VastRunnerError("remote-result-invalid", "The remote runner did not return a JSON result", _safe_output(output))
 
-    async def check_compatibility(self) -> dict[str, Any]:
+    async def check_compatibility(self, *, reviewed_egress_experiment: bool = False) -> dict[str, Any]:
+        if not isinstance(reviewed_egress_experiment, bool):
+            raise VastRunnerError("compatibility-option-invalid", "The reviewed egress option must be boolean")
         connection = await self.connection()
         await self.sync_project(connection)
         probe_directory = f"{REMOTE_RUNS}/{uuid.uuid4()}"
         probe_temporary_directory = f"/tmp/bu-{uuid.uuid4().hex[:12]}"
+        reviewed_egress_argument = " --reviewed-egress-experiment" if reviewed_egress_experiment else ""
         command = (
             f"install -d -m 0700 -o {REMOTE_CAPTURE_USER} -g {REMOTE_CAPTURE_USER} "
             f"{_shell_quote(probe_directory)} {_shell_quote(probe_temporary_directory)} "
@@ -346,7 +349,8 @@ class VastRunner:
             f"TMPDIR={_shell_quote(probe_temporary_directory)} "
             f"{self._browser_environment()} "
             f"timeout --signal=TERM --kill-after=5s 120s {_shell_quote(REMOTE_VENV + '/bin/python')} "
-            f"{_shell_quote(REMOTE_APP + '/scripts/verify_compatibility.py')}; "
+            f"{_shell_quote(REMOTE_APP + '/scripts/verify_compatibility.py')}"
+            f"{reviewed_egress_argument}; "
             "code=$?; "
             f"rm -rf -- {_shell_quote(probe_directory)} {_shell_quote(probe_temporary_directory)}; "
             "exit \"$code\""
@@ -378,6 +382,12 @@ class VastRunner:
         elif cpu.get("status") != "verified" or gpu.get("status") != "verified":
             payload["status"] = "blocked"
             payload["failureReason"] = payload.get("failureReason") or cpu.get("failureReason") or gpu.get("reason") or "CPU and GPU checks did not both pass"
+        if reviewed_egress_experiment:
+            payload["diagnosticOnly"] = True
+            payload["captureAuthorized"] = False
+            if payload.get("status") == "verified":
+                payload["status"] = "blocked"
+                payload["failureReason"] = "temporary egress experiment cannot authorize capture"
         return payload
 
     async def _copy_remote_file(self, connection: VastConnection, remote_path: str, local_path: Path) -> None:

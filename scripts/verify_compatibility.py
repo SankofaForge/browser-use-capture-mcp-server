@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import importlib.metadata
 import json
@@ -12,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+from collections.abc import Coroutine
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -21,11 +23,16 @@ import aiohttp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "remote"))
 from capture_worker import _clean_chrome_args
-from public_socks_proxy import PublicSocksProxy
+from public_socks_proxy import (
+    REVIEWED_EGRESS_HOSTS,
+    REVIEWED_EGRESS_TTL_SECONDS,
+    PublicSocksProxy,
+)
 
 
 STARTUP_TIMEOUT_SECONDS = 30
 COMMAND_TIMEOUT_SECONDS = 5
+VERIFY_TIMEOUT_SECONDS = 110
 PROBE_URL = "https://example.com"
 GPU_ARGS = [
     "--disable-dev-shm-usage",
@@ -221,6 +228,21 @@ async def _kill_session(session: Any) -> None:
     if not callable(kill):
         raise RuntimeError("BrowserSession.kill() is unavailable")
     await asyncio.wait_for(kill(), timeout=5)
+
+
+async def _await_cleanup(cleanup: Coroutine[Any, Any, None]) -> None:
+    cleanup_task = asyncio.create_task(cleanup)
+    cancellation_received = False
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            if cleanup_task.cancelled():
+                raise
+            cancellation_received = True
+    cleanup_task.result()
+    if cancellation_received:
+        raise asyncio.CancelledError
 
 
 async def _page_cdp_transport(page: Any) -> tuple[Any, str]:
@@ -443,6 +465,7 @@ async def _probe_proxy_policy(proxy: PublicSocksProxy) -> bool:
         raise RuntimeError("SOCKS egress policy did not record blocked destinations")
     proxy.violations.clear()
     proxy.blocked_destinations.clear()
+    proxy.connection_outcomes.clear()
     return True
 
 
@@ -489,7 +512,34 @@ async def _probe_page(page: Any, session: Any) -> tuple[str, str | None, bool, l
     return title, renderer if isinstance(renderer, str) else None, True, jank.get("entries", [])
 
 
-async def verify() -> dict[str, object]:
+def _attach_probe_metadata(result: dict[str, Any], reviewed_egress_experiment: bool) -> dict[str, Any]:
+    result["requestMetadataLimitations"] = {
+        "source": "SOCKS CONNECT tunnel; payload inspection disabled",
+        "recordedFields": ["destination hostname", "port", "connection outcome"],
+        "notCollectedFields": ["URL path", "HTTP method", "request initiator"],
+        "httpsMetadataRequiresTlsInterception": True,
+        "rawNetLogCaptured": False,
+    }
+    result["temporaryEgressApproval"] = {
+        "enabled": reviewed_egress_experiment,
+        "scope": "single compatibility-probe process",
+        "hostnames": sorted(REVIEWED_EGRESS_HOSTS) if reviewed_egress_experiment else [],
+        "port": 443,
+        "maxLifetimeSeconds": REVIEWED_EGRESS_TTL_SECONDS if reviewed_egress_experiment else 0,
+        "probeDeadlineSeconds": VERIFY_TIMEOUT_SECONDS,
+    }
+    if reviewed_egress_experiment:
+        result["diagnosticOnly"] = True
+        result["captureAuthorized"] = False
+        if result.get("status") == "verified":
+            result["status"] = "blocked"
+            result["failureReason"] = "temporary egress experiment cannot authorize capture"
+    return result
+
+
+async def verify(*, reviewed_egress_experiment: bool = False) -> dict[str, object]:
+    if not isinstance(reviewed_egress_experiment, bool):
+        raise ValueError("reviewed egress experiment flag must be boolean")
     browser_path = _browser_path()
     browser_use_version = _browser_use_version()
     from browser_use.browser.profile import BrowserProfile  # type: ignore[import-not-found]
@@ -506,7 +556,10 @@ async def verify() -> dict[str, object]:
         browser_process = None
         browser_version = None
         renderer = None
-        egress_proxy = PublicSocksProxy(approved_hostname=approved_hostname)
+        egress_proxy = PublicSocksProxy(
+            approved_hostname=approved_hostname,
+            reviewed_egress_experiment=reviewed_egress_experiment,
+        )
         try:
             proxy_port = await egress_proxy.start()
             proxy_policy = await _probe_proxy_policy(egress_proxy)
@@ -560,7 +613,7 @@ async def verify() -> dict[str, object]:
                     if egress_violations
                     else "one or more CPU compatibility checks failed"
                 )
-            return {
+            result = {
                 "status": "verified" if cpu_status == "verified" and gpu["status"] == "verified" else "blocked",
                 "browserExecutable": str(browser_path),
                 "browserUseVersion": browser_use_version,
@@ -574,6 +627,7 @@ async def verify() -> dict[str, object]:
                     "proxyPrivateAndUnapprovedRejection": proxy_policy,
                     "egressPolicyViolations": egress_violations,
                     "blockedDestinations": list(egress_proxy.blocked_destinations),
+                    "connectionOutcomes": list(egress_proxy.connection_outcomes),
                     "profileAllowedDomains": [approved_hostname],
                     "reducedMotion": True,
                     "desktopViewport": {"width": 640, "height": 480},
@@ -584,6 +638,7 @@ async def verify() -> dict[str, object]:
                 "gpu": gpu,
                 "failureReason": _overall_failure_reason(cpu_status, gpu, cpu_failure),
             }
+            return _attach_probe_metadata(result, reviewed_egress_experiment)
         except Exception as error:
             cpu_failure = (
                 "network egress policy blocked one or more browser requests"
@@ -591,7 +646,7 @@ async def verify() -> dict[str, object]:
                 else str(error)[:300]
             )
             gpu = _gpu_status(renderer)
-            return {
+            result = {
                 "status": "blocked",
                 "browserExecutable": str(browser_path),
                 "browserUseVersion": browser_use_version,
@@ -602,20 +657,25 @@ async def verify() -> dict[str, object]:
                     "domainPolicy": "strict-public-socks-proxy",
                     "egressPolicyViolations": list(egress_proxy.violations),
                     "blockedDestinations": list(egress_proxy.blocked_destinations),
+                    "connectionOutcomes": list(egress_proxy.connection_outcomes),
                     "processCleanup": "kill",
                 },
                 "gpu": gpu,
                 "failureReason": _overall_failure_reason("blocked", gpu, cpu_failure),
             }
+            return _attach_probe_metadata(result, reviewed_egress_experiment)
         finally:
-            if session is not None:
-                with suppress(Exception):
-                    await _kill_session(session)
-            await _stop_process(browser_process)
-            await egress_proxy.close()
+            async def cleanup_resources() -> None:
+                if session is not None:
+                    with suppress(Exception):
+                        await _kill_session(session)
+                await _stop_process(browser_process)
+                await egress_proxy.close()
+
+            await _await_cleanup(cleanup_resources())
 
 
-async def _verify_with_signal_cleanup() -> dict[str, object]:
+async def _verify_with_signal_cleanup(*, reviewed_egress_experiment: bool = False) -> dict[str, object]:
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
     handled_signals = []
@@ -627,10 +687,13 @@ async def _verify_with_signal_cleanup() -> dict[str, object]:
             except (NotImplementedError, RuntimeError):
                 pass
     try:
-        return await verify()
+        return await asyncio.wait_for(
+            verify(reviewed_egress_experiment=reviewed_egress_experiment),
+            timeout=VERIFY_TIMEOUT_SECONDS,
+        )
     except asyncio.CancelledError:
         reason = "compatibility probe was cancelled or exceeded its deadline"
-        return {
+        result = {
             "status": "blocked",
             "browserExecutable": os.environ.get("BROWSER_USE_CHROMIUM_PATH"),
             "browserUseVersion": _browser_use_version_or_none(),
@@ -639,16 +702,40 @@ async def _verify_with_signal_cleanup() -> dict[str, object]:
             "gpu": {"status": "blocked", "reason": reason},
             "failureReason": reason,
         }
+        return _attach_probe_metadata(result, reviewed_egress_experiment)
+    except asyncio.TimeoutError:
+        reason = f"compatibility probe exceeded its {VERIFY_TIMEOUT_SECONDS:g}-second deadline"
+        result = {
+            "status": "blocked",
+            "browserExecutable": os.environ.get("BROWSER_USE_CHROMIUM_PATH"),
+            "browserUseVersion": _browser_use_version_or_none(),
+            "browserVersion": None,
+            "cpu": {"status": "blocked", "failureReason": reason},
+            "gpu": {"status": "blocked", "reason": reason},
+            "failureReason": reason,
+        }
+        return _attach_probe_metadata(result, reviewed_egress_experiment)
     finally:
         for sig in handled_signals:
             loop.remove_signal_handler(sig)
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Run the fail-closed Browser Use compatibility probe")
+    parser.add_argument(
+        "--reviewed-egress-experiment",
+        action="store_true",
+        help="temporarily allow only the two reviewed HTTPS hosts for this diagnostic probe",
+    )
+    arguments = parser.parse_args()
     try:
-        result = asyncio.run(_verify_with_signal_cleanup())
+        result = asyncio.run(
+            _verify_with_signal_cleanup(
+                reviewed_egress_experiment=arguments.reviewed_egress_experiment,
+            )
+        )
     except Exception as error:  # pragma: no cover - exercised by the runner
-        print(json.dumps({
+        result = {
             "status": "blocked",
             "browserExecutable": os.environ.get("BROWSER_USE_CHROMIUM_PATH"),
             "browserUseVersion": _browser_use_version_or_none(),
@@ -656,7 +743,8 @@ def main() -> int:
             "cpu": {"status": "blocked", "failureReason": str(error)},
             "gpu": {"status": "blocked"},
             "failureReason": str(error),
-        }, sort_keys=True))
+        }
+        print(json.dumps(_attach_probe_metadata(result, arguments.reviewed_egress_experiment), sort_keys=True))
         return 1
     print(json.dumps(result, sort_keys=True))
     return 0 if result["status"] == "verified" else 1
