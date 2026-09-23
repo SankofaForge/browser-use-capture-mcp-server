@@ -256,6 +256,7 @@ def _issue_capability_record(probe: dict[str, Any], runner: VastRunner) -> dict[
         "status": "verified",
         "gpu": probe["gpu"],
         "cpu": probe["cpu"],
+        "egressPolicy": probe["egressPolicy"],
         "browserUseVersion": probe.get("browserUseVersion"),
         "browserVersion": probe.get("browserVersion"),
         "browserExecutable": probe.get("browserExecutable"),
@@ -406,17 +407,56 @@ async def _compatibility_result(runner: VastRunner) -> dict[str, Any]:
         return _blocked(error.reason_code, str(error), diagnostic=error.diagnostic)
     except Exception as error:
         return _blocked("browser-use-compatibility-unverified", "The remote Browser Use compatibility probe failed", diagnostic=str(error))
-    if probe.get("status") != "verified" or probe.get("cpu", {}).get("status") != "verified":
-        cpu = probe.get("cpu", {})
-        gpu = probe.get("gpu", {})
-        reason = probe.get("failureReason") or gpu.get("reason") or cpu.get("failureReason") or "compatibility checks did not pass"
-        code = "capture-gpu-unavailable" if cpu.get("status") == "verified" and gpu.get("status") != "verified" else "browser-use-compatibility-unverified"
+    if not isinstance(probe, dict):
+        return _blocked(
+            "browser-use-compatibility-unverified",
+            "The remote Browser Use compatibility probe returned an invalid result.",
+            diagnostic="probe result must be an object",
+        )
+    cpu = probe.get("cpu")
+    gpu = probe.get("gpu")
+    egress_policy = probe.get("egressPolicy")
+    cpu = cpu if isinstance(cpu, dict) else {}
+    gpu = gpu if isinstance(gpu, dict) else {}
+    egress_policy = egress_policy if isinstance(egress_policy, dict) else {}
+    unexpected_violations = egress_policy.get("unexpectedViolationCodes")
+    unauthorized_connections = egress_policy.get("unauthorizedConnections")
+    egress_verified = (
+        egress_policy.get("status") == "verified"
+        and egress_policy.get("proxyPolicyCheck") == "verified"
+        and egress_policy.get("browserTrafficBoundary") == "verified"
+        and egress_policy.get("browserServiceReachability") == "verified"
+        and isinstance(unexpected_violations, list)
+        and not unexpected_violations
+        and isinstance(unauthorized_connections, list)
+        and not unauthorized_connections
+    )
+    if (
+        probe.get("status") != "verified"
+        or cpu.get("status") != "verified"
+        or gpu.get("status") != "verified"
+        or not egress_verified
+    ):
+        reason = (
+            probe.get("failureReason")
+            or cpu.get("failureReason")
+            or gpu.get("reason")
+            or egress_policy.get("failureReason")
+            or "compatibility checks did not pass"
+        )
+        if cpu.get("status") != "verified":
+            code = "browser-use-compatibility-unverified"
+        elif gpu.get("status") != "verified":
+            code = "capture-gpu-unavailable"
+        else:
+            code = "capture-egress-policy-unverified"
         return _blocked(
             code,
-            "CPU and NVIDIA/WebGL compatibility must both pass before capture",
+            "CPU, GPU, and egress checks must pass before capture.",
             diagnostic=str(reason),
             cpu=cpu,
             gpu=gpu,
+            egressPolicy=egress_policy,
             browserExecutable=probe.get("browserExecutable"),
             browserUseVersion=probe.get("browserUseVersion"),
             browserVersion=probe.get("browserVersion"),

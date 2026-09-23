@@ -33,6 +33,7 @@ from public_socks_proxy import (
 STARTUP_TIMEOUT_SECONDS = 30
 COMMAND_TIMEOUT_SECONDS = 5
 VERIFY_TIMEOUT_SECONDS = 110
+PRE_FIXTURE_OBSERVATION_SECONDS = 3
 PROBE_URL = "https://example.com"
 GPU_ARGS = [
     "--disable-dev-shm-usage",
@@ -142,12 +143,104 @@ def _overall_failure_reason(
     cpu_status: str,
     gpu: dict[str, Any],
     cpu_failure_reason: str | None = None,
+    egress_policy: dict[str, Any] | None = None,
 ) -> str | None:
     if cpu_status != "verified":
         return cpu_failure_reason or "one or more CPU compatibility checks failed"
     if gpu.get("status") != "verified":
         return str(gpu.get("reason") or "NVIDIA/WebGL compatibility checks failed")
+    if egress_policy is not None and egress_policy.get("status") != "verified":
+        return str(egress_policy.get("failureReason") or "SOCKS egress policy checks did not pass")
     return None
+
+
+def _egress_snapshot(proxy: PublicSocksProxy) -> dict[str, list[dict[str, Any]]]:
+    return {
+        "blockedDestinations": [dict(entry) for entry in proxy.blocked_destinations],
+        "connectionOutcomes": [dict(entry) for entry in proxy.connection_outcomes],
+    }
+
+
+def _snapshot_delta(
+    before: dict[str, list[dict[str, Any]]],
+    after: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    before_counts = {
+        (entry["hostname"], entry["port"], entry["outcome"]): entry["count"]
+        for entry in before["connectionOutcomes"]
+    }
+    outcome_delta = []
+    for entry in after["connectionOutcomes"]:
+        key = (entry["hostname"], entry["port"], entry["outcome"])
+        count = entry["count"] - before_counts.get(key, 0)
+        if count > 0:
+            outcome_delta.append({**entry, "count": count})
+    before_destinations = {
+        (entry["hostname"], entry["port"], entry["reason"])
+        for entry in before["blockedDestinations"]
+    }
+    destination_delta = [
+        dict(entry)
+        for entry in after["blockedDestinations"]
+        if (entry["hostname"], entry["port"], entry["reason"]) not in before_destinations
+    ]
+    return {
+        "blockedDestinations": destination_delta,
+        "connectionOutcomes": outcome_delta,
+    }
+
+
+def _egress_policy_result(
+    proxy: PublicSocksProxy,
+    proxy_policy_verified: bool,
+    pre_fixture_observations: dict[str, list[dict[str, Any]]] | None,
+) -> dict[str, Any]:
+    expected_denials = {"domain-not-approved"}
+    unexpected_violations = sorted(set(proxy.violations) - expected_denials)
+    unauthorized_connections = [
+        dict(entry)
+        for entry in proxy.connection_outcomes
+        if entry["outcome"] == "connected"
+        and not proxy._destination_is_approved(entry["hostname"], entry["port"])
+    ]
+    proxy_status = (
+        "verified"
+        if proxy_policy_verified and not unexpected_violations and not unauthorized_connections
+        else "blocked"
+    )
+    status = "unverified" if proxy_status == "verified" else "blocked"
+    failure_reason = None
+    if not proxy_policy_verified:
+        failure_reason = "The SOCKS proxy did not block private and unapproved destinations."
+    elif unauthorized_connections:
+        failure_reason = "The SOCKS proxy connected to an unapproved destination."
+    elif unexpected_violations:
+        failure_reason = "The SOCKS proxy reported an unexpected connection error."
+    else:
+        failure_reason = "The browser egress boundary is not independently verified."
+
+    current = _egress_snapshot(proxy)
+    baseline = pre_fixture_observations or {"blockedDestinations": [], "connectionOutcomes": []}
+    return {
+        "status": status,
+        "failureReason": failure_reason,
+        "policy": "exact-host-public-socks-proxy",
+        "proxyPolicyCheck": proxy_status,
+        "browserTrafficBoundary": "unverified",
+        "browserServiceReachability": "not-assessed",
+        "unexpectedViolationCodes": unexpected_violations,
+        "unauthorizedConnections": unauthorized_connections,
+        "blockedDestinations": current["blockedDestinations"],
+        "connectionOutcomes": current["connectionOutcomes"],
+        "preFixtureObservations": baseline,
+        "afterFixtureDelta": _snapshot_delta(baseline, current),
+        "requestAttribution": {
+            "status": "unknown",
+            "urlPathsCollected": False,
+            "initiatorsCollected": False,
+            "phaseObservationsIdentifyInitiators": False,
+        },
+    }
 
 
 async def _wait_for_cdp(process: asyncio.subprocess.Process, port: int) -> tuple[str, str, str]:
@@ -515,11 +608,29 @@ async def _probe_page(page: Any, session: Any) -> tuple[str, str | None, bool, l
 def _attach_probe_metadata(result: dict[str, Any], reviewed_egress_experiment: bool) -> dict[str, Any]:
     result["requestMetadataLimitations"] = {
         "source": "SOCKS CONNECT tunnel; payload inspection disabled",
-        "recordedFields": ["destination hostname", "port", "connection outcome"],
+        "recordedFields": ["destination hostname", "port", "connection outcome", "probe phase"],
         "notCollectedFields": ["URL path", "HTTP method", "request initiator"],
         "httpsMetadataRequiresTlsInterception": True,
         "rawNetLogCaptured": False,
     }
+    result.setdefault("egressPolicy", {
+        "status": "unverified",
+        "failureReason": "The browser egress boundary is not independently verified.",
+        "policy": "exact-host-public-socks-proxy",
+        "proxyPolicyCheck": "unverified",
+        "browserTrafficBoundary": "unverified",
+        "browserServiceReachability": "not-assessed",
+        "unexpectedViolationCodes": [],
+        "unauthorizedConnections": [],
+        "blockedDestinations": [],
+        "connectionOutcomes": [],
+        "requestAttribution": {
+            "status": "unknown",
+            "urlPathsCollected": False,
+            "initiatorsCollected": False,
+            "phaseObservationsIdentifyInitiators": False,
+        },
+    })
     result["temporaryEgressApproval"] = {
         "enabled": reviewed_egress_experiment,
         "scope": "single compatibility-probe process",
@@ -556,6 +667,8 @@ async def verify(*, reviewed_egress_experiment: bool = False) -> dict[str, objec
         browser_process = None
         browser_version = None
         renderer = None
+        proxy_policy = False
+        pre_fixture_observations = None
         egress_proxy = PublicSocksProxy(
             approved_hostname=approved_hostname,
             reviewed_egress_experiment=reviewed_egress_experiment,
@@ -586,6 +699,8 @@ async def verify(*, reviewed_egress_experiment: bool = False) -> dict[str, objec
             if page is None:
                 raise RuntimeError("BrowserSession returned no current page")
             await _install_jank_observer(session, page)
+            await asyncio.sleep(PRE_FIXTURE_OBSERVATION_SECONDS)
+            pre_fixture_observations = _egress_snapshot(egress_proxy)
             title, renderer, domain_restriction, jank_entries = await _probe_page(page, session)
             await page.set_viewport_size(640, 480)
             await page.evaluate(
@@ -604,17 +719,25 @@ async def verify(*, reviewed_egress_experiment: bool = False) -> dict[str, objec
             browser_process = None
             webm_validation = _convert_to_webm(recording_path, webm_path)
             gpu = _gpu_status(renderer)
-            egress_violations = list(egress_proxy.violations)
-            cpu_status = "verified" if domain_restriction and proxy_policy and webm_validation and jank_entries is not None and not egress_violations else "blocked"
+            egress_policy = _egress_policy_result(egress_proxy, proxy_policy, pre_fixture_observations)
+            cpu_status = (
+                "verified"
+                if domain_restriction
+                and webm_validation.get("status") == "valid"
+                and jank_entries is not None
+                else "blocked"
+            )
             cpu_failure = None
             if cpu_status != "verified":
-                cpu_failure = (
-                    "network egress policy blocked one or more browser requests"
-                    if egress_violations
-                    else "one or more CPU compatibility checks failed"
-                )
+                cpu_failure = "one or more CPU compatibility checks failed"
             result = {
-                "status": "verified" if cpu_status == "verified" and gpu["status"] == "verified" else "blocked",
+                "status": (
+                    "verified"
+                    if cpu_status == "verified"
+                    and gpu["status"] == "verified"
+                    and egress_policy["status"] == "verified"
+                    else "blocked"
+                ),
                 "browserExecutable": str(browser_path),
                 "browserUseVersion": browser_use_version,
                 "browserVersion": browser_version,
@@ -624,10 +747,6 @@ async def verify(*, reviewed_egress_experiment: bool = False) -> dict[str, objec
                     "title": title,
                     "recording": webm_validation,
                     "domainPolicy": "strict-public-socks-proxy",
-                    "proxyPrivateAndUnapprovedRejection": proxy_policy,
-                    "egressPolicyViolations": egress_violations,
-                    "blockedDestinations": list(egress_proxy.blocked_destinations),
-                    "connectionOutcomes": list(egress_proxy.connection_outcomes),
                     "profileAllowedDomains": [approved_hostname],
                     "reducedMotion": True,
                     "desktopViewport": {"width": 640, "height": 480},
@@ -636,16 +755,14 @@ async def verify(*, reviewed_egress_experiment: bool = False) -> dict[str, objec
                     "processCleanup": "kill",
                 },
                 "gpu": gpu,
-                "failureReason": _overall_failure_reason(cpu_status, gpu, cpu_failure),
+                "egressPolicy": egress_policy,
+                "failureReason": _overall_failure_reason(cpu_status, gpu, cpu_failure, egress_policy),
             }
             return _attach_probe_metadata(result, reviewed_egress_experiment)
         except Exception as error:
-            cpu_failure = (
-                "network egress policy blocked one or more browser requests"
-                if egress_proxy.violations
-                else str(error)[:300]
-            )
+            cpu_failure = str(error)[:300]
             gpu = _gpu_status(renderer)
+            egress_policy = _egress_policy_result(egress_proxy, proxy_policy, pre_fixture_observations)
             result = {
                 "status": "blocked",
                 "browserExecutable": str(browser_path),
@@ -655,13 +772,11 @@ async def verify(*, reviewed_egress_experiment: bool = False) -> dict[str, objec
                     "status": "blocked",
                     "failureReason": cpu_failure,
                     "domainPolicy": "strict-public-socks-proxy",
-                    "egressPolicyViolations": list(egress_proxy.violations),
-                    "blockedDestinations": list(egress_proxy.blocked_destinations),
-                    "connectionOutcomes": list(egress_proxy.connection_outcomes),
                     "processCleanup": "kill",
                 },
                 "gpu": gpu,
-                "failureReason": _overall_failure_reason("blocked", gpu, cpu_failure),
+                "egressPolicy": egress_policy,
+                "failureReason": _overall_failure_reason("blocked", gpu, cpu_failure, egress_policy),
             }
             return _attach_probe_metadata(result, reviewed_egress_experiment)
         finally:

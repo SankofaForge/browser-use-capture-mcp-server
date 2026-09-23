@@ -7,12 +7,13 @@ stdio local, then invokes the pinned Browser Use worker on the rented Linux GPU
 runner through the current SSH endpoint provided by Vast. Browser Use and
 Chrome do not run on the local workflow host.
 
-Status: the Vast SSH bridge and remote worker are implemented. The runner now
-starts Chrome through explicit CDP launch, records a valid probe WebM, installs
-the jank observer, and verifies the NVIDIA-backed WebGL renderer. The latest
-CPU compatibility result remains blocked because Chrome requests six
-non-approved background service hosts. No capture acceptance or complete
-evidence is claimed.
+The latest live probe passed CDP startup, page evaluation, viewport and
+reduced-motion control, jank collection, WebM recording, cleanup, and hardware
+WebGL.
+It did not prove that every Chrome network path uses the SOCKS proxy. The
+compatibility result now reports CPU behavior, GPU support, and egress status
+separately. Egress remains unverified, so the adapter must not issue a
+`gpu_check_id` or claim complete evidence.
 
 The adapter is intentionally fail-closed. Browser Use releases have changed
 their session and recording APIs, and this project must not create a WebM or
@@ -33,14 +34,18 @@ adapter only through its secret-aware environment; never put secret values in
 workflow configuration or diagnostics. Resolve the SSH host and port
 dynamically from Vast instead of hard-coding an instance endpoint.
 
-The current probe passes startup/CDP, page evaluation, viewport and
-reduced-motion control, jank-observer installation, WebM creation, process
-cleanup, `nvidia-smi`, and hardware-backed WebGL. CPU compatibility remains
-blocked by requests to `clients2.google.com`, `www.gstatic.com`,
-`www.google.com`, `update.googleapis.com`, `accounts.google.com`, and
-`android.clients.google.com`. The exact-host SOCKS proxy rejects them; none is
-allowlisted. Do not issue a `gpu_check_id` or capture evidence until the CPU
-gate passes.
+The compatibility report treats `domain-not-approved` outcomes as proxy
+denials, not CPU-function failures. It records them under
+`egressPolicy.blockedDestinations`. Private destinations, proxy errors, and
+unapproved successful connections still block the egress result. The report
+also separates observations made before and after fixture navigation. These
+phases do not identify request initiators, URL paths, or Chrome services.
+
+The proxy's negative-control checks do not prove that all Chrome traffic uses
+the proxy. The result therefore keeps `egressPolicy.status` unverified until a
+browser-wide egress boundary is verified. It also reports Safe Browsing and
+component-update reachability as not assessed. No `gpu_check_id` is issued
+while either fact remains unresolved.
 
 A bounded runtime sweep on 2026-09-22 did not find a passing alternative.
 Chrome for Testing Stable 154.0.8037.57 passed the browser and hardware-WebGL
@@ -77,10 +82,12 @@ diagnostic-only and cannot authorize capture or issue a `gpu_check_id`. Do not
 add hosts through command-line values or configuration.
 
 The proxy records a bounded summary of destination hostname, port, and
-connection outcome. It does not inspect tunneled payloads, collect URL paths or
-HTTP methods, or observe request initiators. HTTPS metadata would require TLS
-interception, which is outside this diagnostic. It does not collect raw NetLog
-data; keep path-based attributions separate and qualified.
+connection outcome. The probe also records whether an observation occurred
+before or after fixture navigation. It does not inspect tunneled payloads,
+collect URL paths or HTTP methods, or observe request initiators. HTTPS
+metadata would require TLS interception, which is outside this diagnostic.
+The probe does not collect raw NetLog data. Do not infer a request source from
+its phase alone.
 
 The approved diagnostic ran once on 2026-09-23. Both candidate hosts connected,
 but CPU compatibility remained blocked by other destinations, including
@@ -90,20 +97,21 @@ hardware-backed WebGL passed. The probe remained diagnostic-only, issued no
 `gpu_check_id`, and did not change the ordinary proxy policy. See the [egress
 proposal and result](../../agent-infrastructure/knowledge/browser-use-capture-egress-proposal.md).
 
-The probe must explicitly launch Chrome, wait for its loopback CDP endpoint,
-and attach `BrowserSession` to that session. It must verify page evaluation,
-desktop/mobile viewport control, reduced-motion emulation, jank instrumentation,
-domain enforcement, recording and WebM validation, and explicit process/profile
-cleanup. The machine-readable JSON result must retain the executable path,
-Browser Use release, browser version, distinct CPU and GPU gate results, and a
-concrete `failureReason` when blocked. Preserve known values in blocked results.
-Test the case where CPU compatibility fails but the GPU check passes; the GPU
-result must not hide the CPU failure reason.
+The probe must launch Chrome, wait for its loopback CDP endpoint, and attach
+`BrowserSession`. It must verify page evaluation, viewport control,
+reduced-motion emulation, jank instrumentation, domain enforcement, recording,
+WebM validation, and cleanup. The JSON result must report separate CPU, GPU, and
+egress results. It must retain the executable path and browser versions, even
+when a gate fails. A CPU or GPU pass cannot override an unverified egress
+boundary. Test each blocked state and preserve its failure reason.
 
-The CPU compatibility gate is distinct from the GPU gate. The GPU gate requires
-both a working `nvidia-smi` and a hardware-backed WebGL renderer; SwiftShader
-or another software renderer fails. A CPU pass never authorizes capture or
-issues an authoritative `gpu_check_id`. Bind a fresh ID to the passing runner,
+The CPU gate checks browser functions. The GPU gate requires a working
+`nvidia-smi` and a hardware-backed WebGL renderer. SwiftShader and other
+software renderers fail. The egress gate must verify the browser-wide network
+boundary and required browser security-service reachability. A SOCKS
+negative-control result or successful TCP connection alone cannot pass that
+gate. A fresh
+`gpu_check_id` requires all three results to pass and must bind to the runner,
 browser executable, and Browser Use release.
 
 ## Recover from a startup timeout
@@ -117,11 +125,15 @@ browser executable, and Browser Use release.
    loopback debugging port. Wait for `/json/version` to report CDP readiness,
    then attach Browser Use using that CDP URL. Do not rely on Browser Use's
    local executable-discovery startup path.
-4. Run the locked CPU probe, then the independent GPU/WebGL gate. Record the
-   JSON result and repair the reported cause before retrying.
-5. Only after both gates pass may `check_capture_gpu` issue a fresh,
-   runner-bound `gpu_check_id`. No manual compatibility override or automatic
-   `site-motion-capture` fallback is permitted.
+4. Run the locked CPU and GPU/WebGL checks. Review the egress result separately.
+   A SOCKS negative-control pass does not prove that all browser traffic uses
+   the proxy or verify required browser security-service reachability. A TCP
+   connection alone does not prove that a service works. Record the JSON result
+   and repair the reported cause before retrying.
+5. Only after CPU, GPU, and browser-wide egress checks pass may
+   `check_capture_gpu` issue a fresh, runner-bound `gpu_check_id`. No manual
+   compatibility override or automatic `site-motion-capture` fallback is
+   permitted.
 
 Missing browser, SSH or startup timeout, missing GPU, software WebGL renderer,
 recording or jank failure, consent uncertainty, domain violation, timeout,
