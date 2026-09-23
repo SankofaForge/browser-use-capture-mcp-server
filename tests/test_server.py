@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import socket
@@ -37,6 +38,34 @@ def _configured_runner(monkeypatch):
     monkeypatch.setenv("VAST_API_KEY", "test-secret-not-printed")
     monkeypatch.setenv("BROWSER_USE_CHROMIUM_PATH", "/opt/google/chrome/chrome")
     return VastRunner()
+
+
+def _verified_egress_policy():
+    expected_denial = {
+        "hostname": "clients2.google.com",
+        "port": 80,
+        "reason": "domain-not-approved",
+    }
+    return {
+        "status": "verified",
+        "proxyPolicyCheck": "verified",
+        "browserTrafficBoundary": "verified",
+        "browserServiceReachability": "verified",
+        "unexpectedViolationCodes": [],
+        "blockedDestinations": [expected_denial],
+        "connectionOutcomes": [{
+            "hostname": "clients2.google.com",
+            "port": 80,
+            "outcome": "blocked",
+            "count": 1,
+        }],
+        "unauthorizedConnections": [],
+        "requestAttribution": {
+            "status": "unknown",
+            "urlPathsCollected": False,
+            "initiatorsCollected": False,
+        },
+    }
 
 
 def test_compatibility_gate_requires_remote_runner_configuration(monkeypatch):
@@ -155,10 +184,12 @@ def test_capability_is_bound_to_runner_and_expires(monkeypatch):
     probe = {
         "cpu": {"status": "verified"},
         "gpu": {"status": "verified", "device": "NVIDIA GeForce RTX"},
+        "egressPolicy": _verified_egress_policy(),
         "browserUseVersion": "0.13.10",
     }
     capability = _issue_capability_record(probe, runner)
     capability_id = capability["gpu_check_id"]
+    assert capability["egressPolicy"] == probe["egressPolicy"]
     assert _verified_capability(capability_id, runner) is None
     monkeypatch.setenv("VAST_INSTANCE_ID", "52085191")
     assert _verified_capability(capability_id, VastRunner())["reasonCode"] == "gpu-check-stale"
@@ -184,7 +215,12 @@ def test_remote_manifest_requires_exact_hashed_evidence(tmp_path: Path):
     }
     checked = _validate_remote_manifest(manifest, tmp_path, "name", manifest["runId"])
     assert {entry["path"] for entry in checked} == {"name.webm", "name.jank.json"}
+    assert "egressPolicy" not in manifest
     manifest["files"][0]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="hash or size"):
+        _validate_remote_manifest(manifest, tmp_path, "name", manifest["runId"])
+    manifest["files"][0]["sha256"] = hashlib.sha256(video.read_bytes()).hexdigest()
+    manifest["files"][0]["size"] += 1
     with pytest.raises(ValueError, match="hash or size"):
         _validate_remote_manifest(manifest, tmp_path, "name", manifest["runId"])
 
@@ -296,3 +332,97 @@ def test_probe_failure_reasons_remain_structured(monkeypatch):
     result = __import__("asyncio").run(_compatibility_result(Runner()))
     assert result["reasonCode"] == "capture-gpu-unavailable"
     assert result["gpu"]["status"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    "egress_policy",
+    [
+        None,
+        ["not-an-object"],
+        {"status": "unknown"},
+        {"status": "unverified", "browserTrafficBoundary": "unverified"},
+        {"status": "blocked", "unauthorizedConnections": [{"hostname": "bad.example", "port": 443}]},
+        {"status": "verified"},
+        {
+            **_verified_egress_policy(),
+            "proxyPolicyCheck": "blocked",
+        },
+        {
+            **_verified_egress_policy(),
+            "unexpectedViolationCodes": ["unexpected-proxy-error"],
+        },
+        {
+            **_verified_egress_policy(),
+            "unauthorizedConnections": [{
+                "hostname": "bad.example",
+                "port": 443,
+                "outcome": "connected",
+                "count": 1,
+            }],
+        },
+        {
+            **_verified_egress_policy(),
+            "browserTrafficBoundary": "unverified",
+        },
+        {
+            **_verified_egress_policy(),
+            "browserServiceReachability": "not-assessed",
+        },
+    ],
+)
+def test_incomplete_egress_evidence_blocks_capability_issuance(egress_policy):
+    from browser_use_capture_mcp.server import _compatibility_result
+
+    class Runner:
+        instance_id = "52085190"
+        browser_path = "/opt/google/chrome/chrome"
+
+        async def check_compatibility(self):
+            probe = {
+                "status": "verified",
+                "cpu": {"status": "verified"},
+                "gpu": {"status": "verified", "device": "NVIDIA GeForce RTX 3060"},
+                "browserExecutable": self.browser_path,
+                "browserUseVersion": "0.13.10",
+                "browserVersion": "Chrome/154.0",
+            }
+            if egress_policy is not None:
+                probe["egressPolicy"] = egress_policy
+            return probe
+
+    existing_capabilities = set(_CAPABILITY_RECORDS)
+    result = asyncio.run(_compatibility_result(Runner()))
+
+    assert result["status"] == "blocked"
+    assert result["reasonCode"] == "capture-egress-policy-unverified"
+    assert "gpu_check_id" not in result
+    expected_egress_policy = egress_policy if isinstance(egress_policy, dict) else {}
+    assert result["egressPolicy"] == expected_egress_policy
+    assert set(_CAPABILITY_RECORDS) == existing_capabilities
+
+
+def test_verified_egress_is_preserved_when_issuing_capability():
+    from browser_use_capture_mcp.server import _compatibility_result
+
+    class Runner:
+        instance_id = "52085190"
+        browser_path = "/opt/google/chrome/chrome"
+
+        async def check_compatibility(self):
+            return {
+                "status": "verified",
+                "cpu": {"status": "verified"},
+                "gpu": {"status": "verified", "device": "NVIDIA GeForce RTX 3060"},
+                "egressPolicy": _verified_egress_policy(),
+                "browserExecutable": self.browser_path,
+                "browserUseVersion": "0.13.10",
+                "browserVersion": "Chrome/154.0",
+            }
+
+    runner = Runner()
+    result = asyncio.run(_compatibility_result(runner))
+
+    assert result["status"] == "verified"
+    assert result["egressPolicy"]["status"] == "verified"
+    assert result["egressPolicy"]["requestAttribution"]["status"] == "unknown"
+    assert _verified_capability(result["gpu_check_id"], runner) is None
