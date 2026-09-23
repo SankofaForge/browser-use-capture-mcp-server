@@ -6,7 +6,12 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "remote"))
-from public_socks_proxy import PublicSocksProxy
+from public_socks_proxy import (
+    REVIEWED_EGRESS_HOSTS,
+    REVIEWED_EGRESS_TTL_SECONDS,
+    EgressPolicyError,
+    PublicSocksProxy,
+)
 
 
 def _records(addresses: list[str]):
@@ -62,6 +67,94 @@ def test_proxy_rejects_non_approved_hostname_before_dns_lookup():
             await proxy.close()
 
     asyncio.run(run())
+
+
+def test_reviewed_egress_experiment_allows_only_two_exact_https_hosts():
+    resolved = []
+
+    def resolver(host: str, port: int, *, type: int):
+        resolved.append((host, port))
+        return _records(["1.1.1.1"])(host, port, type=type)
+
+    async def run():
+        proxy = PublicSocksProxy(
+            approved_hostname="site.example",
+            reviewed_egress_experiment=True,
+            resolver=resolver,
+        )
+        for hostname in REVIEWED_EGRESS_HOSTS:
+            assert await proxy._resolve_public_address(hostname, 443) == ("1.1.1.1", 4)
+        for hostname, port in (
+            ("www.gstatic.com", 80),
+            ("update.googleapis.com", 80),
+            ("sub.www.gstatic.com", 443),
+            ("accounts.google.com", 443),
+        ):
+            try:
+                await proxy._resolve_public_address(hostname, port)
+            except EgressPolicyError as error:
+                assert error.reason_code == "domain-not-approved"
+            else:
+                raise AssertionError(f"unexpectedly approved {hostname}:{port}")
+        assert set(resolved) == {(hostname, 443) for hostname in REVIEWED_EGRESS_HOSTS}
+
+    asyncio.run(run())
+
+
+def test_reviewed_egress_experiment_expires_after_one_hour():
+    now = [100.0]
+
+    async def run():
+        proxy = PublicSocksProxy(
+            approved_hostname="site.example",
+            reviewed_egress_experiment=True,
+            resolver=_records(["1.1.1.1"]),
+            clock=lambda: now[0],
+        )
+        assert await proxy._resolve_public_address("www.gstatic.com", 443) == ("1.1.1.1", 4)
+        now[0] += REVIEWED_EGRESS_TTL_SECONDS
+        try:
+            await proxy._resolve_public_address("www.gstatic.com", 443)
+        except EgressPolicyError as error:
+            assert error.reason_code == "domain-not-approved"
+        else:
+            raise AssertionError("reviewed egress approval remained active after expiry")
+
+    asyncio.run(run())
+
+
+def test_reviewed_egress_flag_defaults_to_disabled():
+    async def run():
+        proxy = PublicSocksProxy(approved_hostname="site.example")
+        await proxy.start()
+        try:
+            reply = await _request_connect(proxy, "www.gstatic.com", 443)
+            assert reply[1] == 2
+            assert proxy.connection_outcomes == [{
+                "hostname": "www.gstatic.com",
+                "port": 443,
+                "outcome": "blocked",
+                "count": 1,
+            }]
+            assert not {"path", "method", "initiator"}.intersection(proxy.connection_outcomes[0])
+        finally:
+            await proxy.close()
+
+    asyncio.run(run())
+
+
+def test_connection_outcomes_are_aggregated_without_request_data():
+    proxy = PublicSocksProxy(approved_hostname="site.example")
+
+    proxy._record_connection_outcome("WWW.GSTATIC.COM.", 443, "connected")
+    proxy._record_connection_outcome("www.gstatic.com", 443, "connected")
+
+    assert proxy.connection_outcomes == [{
+        "hostname": "www.gstatic.com",
+        "port": 443,
+        "outcome": "connected",
+        "count": 2,
+    }]
 
 
 def test_proxy_rejects_non_public_literal_address():

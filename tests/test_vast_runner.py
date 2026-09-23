@@ -162,6 +162,7 @@ def test_compatibility_probe_uses_short_run_scoped_temp_paths(monkeypatch):
         return None
 
     async def fake_run_remote(connection, command, **kwargs):
+        assert "--reviewed-egress-experiment" not in command
         assert "HOME='/tmp/bu-" in command
         assert "TMPDIR='/tmp/bu-" in command
         assert "HOME='/workspace/browser-use-capture/runs/" not in command
@@ -174,6 +175,42 @@ def test_compatibility_probe_uses_short_run_scoped_temp_paths(monkeypatch):
     result = asyncio.run(runner.check_compatibility())
 
     assert result["status"] == "verified"
+
+
+def test_reviewed_egress_probe_is_explicit_and_never_authorizes_capture(monkeypatch):
+    monkeypatch.setenv("BROWSER_USE_CHROMIUM_PATH", "/opt/google/chrome/chrome")
+    runner = VastRunner()
+    payload = {
+        "status": "verified",
+        "browserExecutable": "/opt/google/chrome/chrome",
+        "browserUseVersion": "0.13.10",
+        "browserVersion": "Chrome/154.0.8037.57",
+        "cpu": {"status": "verified"},
+        "gpu": {"status": "verified"},
+    }
+    commands = []
+
+    async def fake_connection():
+        return VastConnection("root", "8.8.8.8", 2222)
+
+    async def fake_sync_project(connection):
+        return None
+
+    async def fake_run_remote(connection, command, **kwargs):
+        commands.append(command)
+        return json.dumps(payload).encode(), b""
+
+    monkeypatch.setattr(runner, "connection", fake_connection)
+    monkeypatch.setattr(runner, "sync_project", fake_sync_project)
+    monkeypatch.setattr(runner, "_run_remote", fake_run_remote)
+
+    result = asyncio.run(runner.check_compatibility(reviewed_egress_experiment=True))
+
+    assert "--reviewed-egress-experiment" in commands[0]
+    assert result["status"] == "blocked"
+    assert result["diagnosticOnly"] is True
+    assert result["captureAuthorized"] is False
+    assert result["failureReason"] == "temporary egress experiment cannot authorize capture"
 
 
 def test_vast_api_key_is_not_inherited_by_ssh_processes(monkeypatch):

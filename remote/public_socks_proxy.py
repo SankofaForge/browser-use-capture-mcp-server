@@ -6,8 +6,13 @@ import asyncio
 import contextlib
 import ipaddress
 import socket
+import time
 from collections.abc import Callable
 from typing import Any
+
+
+REVIEWED_EGRESS_HOSTS = frozenset({"www.gstatic.com", "update.googleapis.com"})
+REVIEWED_EGRESS_TTL_SECONDS = 60 * 60
 
 
 class EgressPolicyError(RuntimeError):
@@ -21,7 +26,9 @@ class PublicSocksProxy:
         self,
         *,
         approved_hostname: str,
+        reviewed_egress_experiment: bool = False,
         resolver: Callable[..., list[tuple[Any, ...]]] = socket.getaddrinfo,
+        clock: Callable[[], float] = time.monotonic,
         host: str = "127.0.0.1",
     ) -> None:
         self.resolver = resolver
@@ -32,10 +39,20 @@ class PublicSocksProxy:
             raise ValueError("approved hostname is invalid") from error
         if not self.approved_hostname:
             raise ValueError("approved hostname is required")
+        if not isinstance(reviewed_egress_experiment, bool):
+            raise ValueError("reviewed egress experiment flag must be boolean")
+        self._clock = clock
+        self.reviewed_egress_experiment = reviewed_egress_experiment
+        self._reviewed_egress_expires_at = (
+            self._clock() + REVIEWED_EGRESS_TTL_SECONDS
+            if reviewed_egress_experiment
+            else None
+        )
         self.port = 0
         self.server: asyncio.Server | None = None
         self.violations: list[str] = []
         self.blocked_destinations: list[dict[str, Any]] = []
+        self.connection_outcomes: list[dict[str, Any]] = []
         self._handlers: set[asyncio.Task[Any]] = set()
 
     async def start(self) -> int:
@@ -72,6 +89,38 @@ class PublicSocksProxy:
         if entry not in self.blocked_destinations and len(self.blocked_destinations) < 100:
             self.blocked_destinations.append(entry)
 
+    def _record_connection_outcome(self, host: str, port: int, outcome: str) -> None:
+        try:
+            normalized_host = host.encode("idna").decode("ascii").lower().rstrip(".")
+        except UnicodeError:
+            normalized_host = "invalid-host"
+        for entry in self.connection_outcomes:
+            if (
+                entry["hostname"] == normalized_host
+                and entry["port"] == port
+                and entry["outcome"] == outcome
+            ):
+                entry["count"] += 1
+                return
+        if len(self.connection_outcomes) < 100:
+            self.connection_outcomes.append({
+                "hostname": normalized_host[:253],
+                "port": port,
+                "outcome": outcome,
+                "count": 1,
+            })
+
+    def _destination_is_approved(self, hostname: str, port: int) -> bool:
+        if hostname == self.approved_hostname:
+            return port in {80, 443}
+        return (
+            self.reviewed_egress_experiment
+            and hostname in REVIEWED_EGRESS_HOSTS
+            and port == 443
+            and self._reviewed_egress_expires_at is not None
+            and self._clock() < self._reviewed_egress_expires_at
+        )
+
     async def _resolve_public_address(self, host: str, port: int) -> tuple[str, int]:
         try:
             normalized_host = host.encode("idna").decode("ascii").lower().rstrip(".")
@@ -86,11 +135,11 @@ class PublicSocksProxy:
         if literal is not None:
             if not literal.is_global:
                 raise EgressPolicyError("non-public-destination")
-            if normalized_host != self.approved_hostname or port not in {80, 443}:
+            if not self._destination_is_approved(normalized_host, port):
                 raise EgressPolicyError("domain-not-approved")
             addresses = [literal]
         else:
-            if normalized_host != self.approved_hostname or port not in {80, 443}:
+            if not self._destination_is_approved(normalized_host, port):
                 raise EgressPolicyError("domain-not-approved")
             try:
                 records = await asyncio.wait_for(
@@ -165,6 +214,7 @@ class PublicSocksProxy:
                 self._record_violation(error.reason_code)
                 if host is not None and port is not None:
                     self._record_blocked_destination(host, port, error.reason_code)
+                    self._record_connection_outcome(host, port, "blocked")
                 await self._reply(writer, self._reply_code(error.reason_code))
                 return
             try:
@@ -178,8 +228,10 @@ class PublicSocksProxy:
                 )
             except (OSError, asyncio.TimeoutError):
                 self._record_violation("public-connect-failed")
+                self._record_connection_outcome(host, port, "connect-failed")
                 await self._reply(writer, 4)
                 return
+            self._record_connection_outcome(host, port, "connected")
             await self._reply(writer, 0)
             await self._relay(reader, writer, upstream_reader, upstream_writer)
         except asyncio.CancelledError:
