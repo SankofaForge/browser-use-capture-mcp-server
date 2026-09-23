@@ -220,10 +220,12 @@ def test_url_policy_rejects_unsupported_or_unsafe_targets(url: str):
 
 
 def test_url_and_diagnostics_redact_sensitive_query_values():
-    value = "https://site.example/path?token=private&theme=dark"
+    value = "https://site.example/path?token=private&theme=dark#access_token=fragment-secret"
 
     assert worker._redacted_url(value) == "https://site.example/path?token=%5BREDACTED%5D&theme=dark"
+    assert "fragment-secret" not in worker._redacted_url(value)
     assert "private" not in worker._redact_text(value)
+    assert "fragment-secret" not in worker._redact_text(value)
     assert worker._redact_text("cookie=private") == "cookie=[REDACTED]"
 
 

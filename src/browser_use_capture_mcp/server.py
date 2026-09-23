@@ -57,12 +57,12 @@ def _redact(value: str) -> str:
     )
     try:
         parts = urlsplit(text)
-        if parts.scheme and parts.netloc and parts.query:
+        if parts.scheme and parts.netloc:
             query = [
                 (key, "[REDACTED]" if SENSITIVE_QUERY_KEYS.fullmatch(key) else item)
                 for key, item in parse_qsl(parts.query, keep_blank_values=True)
             ]
-            text = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+            text = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
     except ValueError:
         pass
     return text
@@ -91,7 +91,7 @@ def _redact_url(value: str) -> str:
             (key, "[REDACTED]" if SENSITIVE_QUERY_KEYS.fullmatch(key) else item)
             for key, item in parse_qsl(parts.query, keep_blank_values=True)
         ]
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
     except ValueError:
         return "[REDACTED URL]"
 

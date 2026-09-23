@@ -213,6 +213,7 @@ def test_secret_like_diagnostics_are_redacted():
     from browser_use_capture_mcp.server import _redact
 
     assert _redact("api_key=never-print") == "api_key=[REDACTED]"
+    assert "fragment-secret" not in _redact("https://example.com/#access_token=fragment-secret")
 
 
 def test_nested_capture_urls_redact_secret_query_values():
@@ -220,11 +221,12 @@ def test_nested_capture_urls_redact_secret_query_values():
 
     result = _redact_output({
         "url": "https://example.com/?token=secret&theme=dark",
-        "nested": {"finalUrl": "https://example.com/?api_key=other"},
+        "nested": {"finalUrl": "https://example.com/?api_key=other#access_token=fragment-secret"},
     })
     serialized = json.dumps(result)
     assert "secret" not in serialized
     assert "other" not in serialized
+    assert "fragment-secret" not in serialized
     assert "theme=dark" in serialized
 
 

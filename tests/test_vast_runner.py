@@ -121,6 +121,28 @@ def test_remote_run_cleanup_is_restricted_to_uuid_path(monkeypatch):
     assert "rm -rf -- '/workspace/browser-use-capture/runs/aa44ec52-ae57-4c73-a574-e824ac649e37'" in seen[0]
 
 
+def test_remote_termination_waits_for_worker_cleanup(monkeypatch):
+    runner = VastRunner()
+    calls = []
+
+    async def fake_run_remote(connection, command, **kwargs):
+        calls.append((command, kwargs))
+        return b"", b""
+
+    monkeypatch.setattr(runner, "_run_remote", fake_run_remote)
+    connection = VastConnection("root", "8.8.8.8", 2222)
+    run_directory = "/workspace/browser-use-capture/runs/aa44ec52-ae57-4c73-a574-e824ac649e37"
+
+    asyncio.run(runner._terminate_remote_run(connection, run_directory))
+
+    command, options = calls[0]
+    assert "kill -TERM" in command
+    assert "seq 1 75" in command
+    assert "kill -0" in command
+    assert "sleep 2" not in command
+    assert options["timeout"] == 90
+
+
 def test_compatibility_probe_uses_short_run_scoped_temp_paths(monkeypatch):
     monkeypatch.setenv("BROWSER_USE_CHROMIUM_PATH", "/opt/google/chrome/chrome")
     runner = VastRunner()

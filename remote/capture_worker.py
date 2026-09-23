@@ -159,12 +159,12 @@ def _redact_text(value: object) -> str:
     text = SENSITIVE_VALUE_PATTERN.sub(r"\1[REDACTED]", text)
     try:
         parts = urlsplit(text)
-        if parts.scheme and parts.netloc and parts.query:
+        if parts.scheme and parts.netloc:
             query = [
                 (key, "[REDACTED]" if SENSITIVE_QUERY_KEYS.fullmatch(key) else item)
                 for key, item in parse_qsl(parts.query, keep_blank_values=True)
             ]
-            text = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+            text = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
     except ValueError:
         pass
     return text[:1200]
@@ -364,7 +364,7 @@ def _redacted_url(raw_url: str) -> str:
     netloc = host
     if parts.port:
         netloc = f"{netloc}:{parts.port}"
-    return urlunsplit((parts.scheme, netloc, parts.path, urlencode(query), parts.fragment))
+    return urlunsplit((parts.scheme, netloc, parts.path, urlencode(query), ""))
 
 
 def is_public_address(address: str) -> bool:

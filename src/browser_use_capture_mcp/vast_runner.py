@@ -397,11 +397,13 @@ class VastRunner:
             f"if test -s {_shell_quote(pid_path)}; then "
             f"pid=$(cat {_shell_quote(pid_path)}); "
             "case \"$pid\" in (*[!0-9]*|'') exit 2;; esac; "
-            "kill -TERM -- \"-$pid\" 2>/dev/null || true; sleep 2; "
+            "kill -TERM -- \"-$pid\" 2>/dev/null || true; "
+            "for attempt in $(seq 1 75); do "
+            "kill -0 -- \"-$pid\" 2>/dev/null || exit 0; sleep 1; done; "
             "kill -KILL -- \"-$pid\" 2>/dev/null || true; fi"
         )
         try:
-            await self._run_remote(connection, command, timeout=15)
+            await self._run_remote(connection, command, timeout=90)
         except (VastRunnerError, asyncio.CancelledError):
             pass
 
