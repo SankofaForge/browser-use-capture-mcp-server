@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "browser-use-capture-mcp-server"
+version = "0.1.0"
+description = "Fail-closed Browser Use capture adapter for the design-inspiration workflow"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "aiohttp>=3.9,<4",
+  "browser-use[video]==0.13.10",
+  "mcp==2.1.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0,<9"]
+
+[dependency-groups]
+dev = ["pytest>=8.0,<9"]
+
+[project.scripts]
+browser-use-capture-mcp = "browser_use_capture_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/browser_use_capture_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
