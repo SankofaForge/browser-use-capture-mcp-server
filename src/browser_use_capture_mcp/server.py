@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
@@ -29,6 +30,7 @@ SERVER_VERSION = "0.2.0"
 DEFAULT_OUTPUT = Path("artifacts/design-inspiration/site-motion-capture")
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 CAPABILITY_TTL_SECONDS = 120
+CAPTURE_BRIDGE_MARGIN_SECONDS = 750
 _CAPABILITY_RECORDS: dict[str, dict[str, Any]] = {}
 _CAPTURE_LOCK = asyncio.Lock()
 SENSITIVE_QUERY_KEYS = re.compile(
@@ -205,22 +207,22 @@ def _validate_capture_input(input_data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("name must contain 1 to 81 safe file-name characters")
     scroll_distance = input_data.get("scroll_distance")
     if scroll_distance is not None:
-        scroll_distance = _bounded_int(scroll_distance, "scroll_distance", 0, 0, 20000)
+        scroll_distance = _bounded_int(scroll_distance, "scroll_distance", 0, 0, 1000000)
     return {
         "url": url,
-        "width": _bounded_int(input_data.get("width"), "width", 1920, 320, 3840),
-        "height": _bounded_int(input_data.get("height"), "height", 1080, 240, 2160),
+        "width": _bounded_int(input_data.get("width"), "width", 1920, 240, 7680),
+        "height": _bounded_int(input_data.get("height"), "height", 1080, 240, 4320),
         "name": name or f"browser-use-{uuid.uuid4().hex[:12]}",
         "output_dir": _output_directory(input_data.get("output_dir")),
         "settle_ms": _bounded_int(input_data.get("settle_ms"), "settle_ms", 2000, 0, 30000),
         "scroll_distance": scroll_distance,
-        "scroll_step": _bounded_int(input_data.get("scroll_step"), "scroll_step", 100, 1, 2000),
-        "scroll_pause_ms": _bounded_int(input_data.get("scroll_pause_ms"), "scroll_pause_ms", 80, 0, 3000),
-        "tail_lines": _bounded_int(input_data.get("tail_lines"), "tail_lines", 800, 0, 5000),
+        "scroll_step": _bounded_int(input_data.get("scroll_step"), "scroll_step", 100, 1, 4000),
+        "scroll_pause_ms": _bounded_int(input_data.get("scroll_pause_ms"), "scroll_pause_ms", 80, 0, 10000),
+        "tail_lines": _bounded_int(input_data.get("tail_lines"), "tail_lines", 800, 0, 30000),
         "auto_discover": _bool_option(input_data.get("auto_discover"), "auto_discover"),
         "consent_mode": consent_mode,
         "consent_accept_approved": consent_accept_approved,
-        "consent_budget_ms": _bounded_int(input_data.get("consent_budget_ms"), "consent_budget_ms", 8000, 0, 60000),
+        "consent_budget_ms": _bounded_int(input_data.get("consent_budget_ms"), "consent_budget_ms", 8000, 0, 30000),
         "consent_max_clicks": _bounded_int(input_data.get("consent_max_clicks"), "consent_max_clicks", 6, 1, 12),
         "consent_wait_ms": _bounded_int(input_data.get("consent_wait_ms"), "consent_wait_ms", 1200, 0, 10000),
         "consent_preflight": _bool_option(input_data.get("consent_preflight"), "consent_preflight", True),
@@ -228,7 +230,7 @@ def _validate_capture_input(input_data: dict[str, Any]) -> dict[str, Any]:
         "reduced_motion": _bool_option(input_data.get("reduced_motion"), "reduced_motion"),
         "no_scroll": _bool_option(input_data.get("no_scroll"), "no_scroll"),
         "gpu": gpu,
-        "timeout_ms": _bounded_int(input_data.get("timeout_ms"), "timeout_ms", 180000, 30000, 600000),
+        "timeout_ms": _bounded_int(input_data.get("timeout_ms"), "timeout_ms", 180000, 1000, 270000),
         "overwrite": _bool_option(input_data.get("overwrite"), "overwrite"),
         **selectors,
     }
@@ -299,7 +301,7 @@ def validate_media(path: Path, ffprobe: str = "ffprobe") -> dict[str, Any]:
         return {"status": "blocked", "reason": "ffprobe is unavailable"}
     try:
         result = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "format=format_name,duration", "-of", "json", str(path)],
+            [ffprobe, "-v", "error", "-show_entries", "format=format_name,duration:stream=codec_type", "-of", "json", str(path)],
             capture_output=True,
             text=True,
             timeout=20,
@@ -311,13 +313,15 @@ def validate_media(path: Path, ffprobe: str = "ffprobe") -> dict[str, Any]:
     if result.returncode != 0:
         return {"status": "blocked", "reason": "ffprobe rejected the WebM"}
     try:
-        format_data = json.loads(result.stdout).get("format", {})
+        probe = json.loads(result.stdout)
+        format_data = probe.get("format", {})
         duration = float(format_data.get("duration", 0))
     except (ValueError, TypeError, json.JSONDecodeError):
         return {"status": "blocked", "reason": "ffprobe returned invalid JSON"}
-    if "webm" not in str(format_data.get("format_name", "")).split(",") or not math.isfinite(duration) or duration <= 0:
+    video_stream_count = sum(1 for stream in probe.get("streams", []) if stream.get("codec_type") == "video")
+    if "webm" not in str(format_data.get("format_name", "")).split(",") or not math.isfinite(duration) or duration <= 0 or video_stream_count < 1:
         return {"status": "blocked", "reason": "ffprobe returned no valid WebM duration"}
-    return {"status": "valid", "format": format_data["format_name"], "durationSeconds": duration}
+    return {"status": "valid", "format": format_data["format_name"], "durationSeconds": duration, "videoStreamCount": video_stream_count}
 
 
 def _validate_jank_report(report: Any) -> dict[str, Any]:
@@ -398,6 +402,84 @@ def _validate_remote_manifest(manifest: Any, stage_dir: Path, name: str, run_id:
     if seen != expected_names:
         raise ValueError("capture manifest evidence files are incomplete")
     return verified
+
+
+def _validate_egress_attestation(
+    evidence: Any,
+    *,
+    capture: dict[str, Any],
+    run_id: str,
+    runner: VastRunner,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(evidence, dict):
+        raise ValueError("runner egress evidence is missing")
+    summary = evidence.get("egress")
+    attestation = evidence.get("egressAttestation")
+    runtime = evidence.get("runtime")
+    if not isinstance(summary, dict) or not isinstance(attestation, dict) or not isinstance(runtime, dict):
+        raise ValueError("runner egress attestation or runtime evidence is missing")
+    try:
+        checked = datetime.fromisoformat(str(attestation.get("checkedAt", "")).replace("Z", "+00:00"))
+        expires = datetime.fromisoformat(str(attestation.get("expiresAt", "")).replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("runner egress attestation timestamps are invalid") from error
+    now = datetime.now(timezone.utc)
+    approved_host = urlsplit(capture["url"]).hostname
+    if not approved_host:
+        raise ValueError("capture URL has no approved hostname for egress binding")
+    approved_host = approved_host.encode("idna").decode("ascii").lower().rstrip(".")
+    proxy_evidence = attestation.get("proxyEvidence")
+    proxy_connections = proxy_evidence.get("connectionOutcomes") if isinstance(proxy_evidence, dict) else None
+    proxy_verified = (
+        isinstance(proxy_evidence, dict)
+        and proxy_evidence.get("violations") == []
+        and isinstance(proxy_connections, list)
+        and any(
+            isinstance(item, dict)
+            and item.get("hostname") == approved_host
+            and item.get("port") == (urlsplit(capture["url"]).port or (443 if urlsplit(capture["url"]).scheme == "https" else 80))
+            and item.get("outcome") == "connected"
+            and item.get("count", 0) > 0
+            for item in proxy_connections
+        )
+    )
+    controls = attestation.get("controls") if isinstance(attestation.get("controls"), dict) else {}
+    direct_control = controls.get("direct") if isinstance(controls.get("direct"), dict) else {}
+    proxied_control = controls.get("proxied") if isinstance(controls.get("proxied"), dict) else {}
+    valid = (
+        attestation.get("schemaVersion") == "runner-egress-boundary.v1"
+        and attestation.get("runId") == run_id
+        and isinstance(attestation.get("boundaryId"), str) and bool(attestation["boundaryId"].strip())
+        and attestation.get("runnerInstanceId") == runner.instance_id
+        and attestation.get("browserExecutable") == runner.browser_path
+        and attestation.get("browserVersion") == runtime.get("browserVersion")
+        and attestation.get("captureRuntime") == "browser-use"
+        and attestation.get("captureRuntimeVersion") == runtime.get("browserUseVersion")
+        and attestation.get("browserUseVersion") == "0.13.10"
+        and attestation.get("approvedHost") == approved_host
+        and isinstance(attestation.get("networkNamespaceInode"), int)
+        and attestation.get("directEgressBlocked") is True
+        and attestation.get("proxyPolicy") == "capture-exact-host.v1"
+        and direct_control.get("status") == "blocked"
+        and proxied_control.get("status") == "passed"
+        and attestation.get("cleanupVerified") is True
+        and checked.tzinfo is not None and expires.tzinfo is not None
+        and checked <= now
+        and expires - checked <= timedelta(seconds=120)
+        and expires > checked
+        and proxy_verified
+        and summary.get("status") == "verified"
+        and summary.get("boundaryId") == attestation.get("boundaryId")
+        and summary.get("directEgressBlocked") is True
+        and summary.get("approvedProxyProbe") is True
+        and summary.get("proxyPolicy") == "capture-exact-host.v1"
+        and summary.get("approvedHost") == approved_host
+        and summary.get("networkNamespaceInode") == attestation.get("networkNamespaceInode")
+        and summary.get("cleanupVerified") is True
+    )
+    if not valid:
+        raise ValueError("runner egress boundary proof is stale, unbound, or incomplete")
+    return summary, attestation
 
 
 async def _compatibility_result(runner: VastRunner) -> dict[str, Any]:
@@ -542,8 +624,47 @@ async def capture_site_motion(
 
     result: dict[str, Any] | None = None
     try:
-        result = await runner.capture(capture, stage_dir)
-        if result.get("status") == "blocked":
+        result = await asyncio.wait_for(
+            runner.capture(capture, stage_dir),
+            timeout=capture["timeout_ms"] / 1000 + CAPTURE_BRIDGE_MARGIN_SECONDS,
+        )
+        if result.get("status") in {"blocked", "partial"}:
+            partial_files = result.get("localArtifacts") if isinstance(result.get("localArtifacts"), dict) else {}
+            partial_artifacts: dict[str, Any] = {}
+            partial_run_id = result.get("runId")
+            if not isinstance(partial_run_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", partial_run_id):
+                partial_run_id = uuid.uuid4().hex
+            destinations = {
+                "webm": targets["video"],
+                "jank": targets["jank"],
+                "manifest": output_dir / f"{stem}.worker-manifest.{partial_run_id}.partial.json",
+            }
+            safe_names = {"webm": f"{stem}.webm", "jank": f"{stem}.jank.json", "manifest": "manifest.json"}
+            for key, filename in safe_names.items():
+                source = stage_dir / filename
+                if partial_files.get(key) != filename or not source.is_file() or source.is_symlink() or source.stat().st_size <= 0:
+                    continue
+                destination = destinations[key]
+                if destination.is_symlink() or (destination.exists() and not capture["overwrite"]):
+                    continue
+                os.replace(source, destination)
+                partial_artifacts[key] = artifact_digest(destination)
+            if partial_artifacts or result.get("status") == "partial":
+                return {
+                    "contractVersion": CONTRACT_VERSION,
+                    "status": "partial",
+                    "runId": result.get("runId"),
+                    "reasonCode": result.get("reasonCode", "capture-partial"),
+                    "failureReason": _redact(str(result.get("failureReason", result.get("message", "capture evidence is incomplete")))),
+                    "url": _redact_url(capture["url"]),
+                    "consent": (
+                        result.get("evidence", {}).get("consent")
+                        if isinstance(result.get("evidence"), dict)
+                        else None
+                    ) or {"mode": capture["consent_mode"], "verified": False},
+                    "cleanup": result.get("remoteCleanup", "pending"),
+                    "artifacts": partial_artifacts,
+                }
             return _blocked(
                 str(result.get("reasonCode", "capture-blocked")),
                 str(result.get("message", "The remote capture worker blocked evidence creation")),
@@ -572,6 +693,9 @@ async def capture_site_motion(
             and not isinstance(worker_duration, bool)
             and math.isfinite(worker_duration)
             and worker_duration > 0
+            and isinstance(worker_media.get("videoStreamCount"), int)
+            and not isinstance(worker_media.get("videoStreamCount"), bool)
+            and worker_media.get("videoStreamCount", 0) >= 1
         )
         if not worker_media_valid:
             local_media = validate_media(video_path)
@@ -579,6 +703,15 @@ async def capture_site_motion(
                 raise ValueError(f"WebM evidence validation failed: {local_media.get('reason', 'remote ffprobe evidence unavailable')}")
             worker_media = local_media
         remote_evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
+        try:
+            egress_evidence, egress_attestation = _validate_egress_attestation(
+                remote_evidence, capture=capture, run_id=run_id, runner=runner,
+            )
+            egress_verified = True
+        except ValueError as error:
+            egress_evidence = {"status": "blocked", "reason": _redact(str(error))}
+            egress_attestation = {}
+            egress_verified = False
         worker_gpu = remote_evidence.get("gpu") if isinstance(remote_evidence.get("gpu"), dict) else {}
         renderer = str(worker_gpu.get("renderer", ""))
         gpu_verified = (
@@ -589,18 +722,23 @@ async def capture_site_motion(
         browser_cleanup_verified = remote_evidence.get("cleanupVerified") is True
         remote_cleanup = result.get("remoteCleanup", "pending")
         cleanup_status = "confirmed" if remote_cleanup == "confirmed" and browser_cleanup_verified else "pending"
+        expected_viewport = {
+            "width": 390 if capture["mobile"] else capture["width"],
+            "height": 844 if capture["mobile"] else capture["height"],
+            "mobile": capture["mobile"],
+            "reducedMotion": capture["reduced_motion"],
+        }
+        reported_viewport = remote_manifest.get("viewport")
+        viewport_verified = isinstance(reported_viewport, dict) and all(
+            reported_viewport.get(key) == value for key, value in expected_viewport.items()
+        )
         manifest = {
             **remote_manifest,
             "contractVersion": CONTRACT_VERSION,
             "cellId": f"{'mobile' if capture['mobile'] else 'desktop'}-{'reduced' if capture['reduced_motion'] else 'full'}",
             "url": _redact_url(capture["url"]),
             "finalUrl": _redact_url(jank.get("finalUrl") or capture["url"]),
-            "viewport": remote_manifest.get("viewport") or {
-                "width": capture["width"],
-                "height": capture["height"],
-                "mobile": capture["mobile"],
-                "reducedMotion": capture["reduced_motion"],
-            },
+            "viewport": reported_viewport if viewport_verified else expected_viewport,
             "modes": {"gpu": capture["gpu"], "scroll": not capture["no_scroll"]},
             "files": files,
             "validation": {"media": worker_media, "jank": {"status": jank["status"]}},
@@ -612,9 +750,13 @@ async def capture_site_motion(
                 and jank.get("consent", {}).get("verified") is True
                 and cleanup_status == "confirmed"
                 and gpu_verified
+                and viewport_verified
+                and egress_verified
             ) else "partial",
             "evidence": {
                 "gpu": {"status": "verified" if gpu_verified else "blocked"},
+                "egress": egress_evidence,
+                "egressAttestation": egress_attestation,
                 "consent": jank.get("consent"),
                 "interactionFailures": jank.get("interactionFailures", []),
                 "scroll": jank.get("scroll"),
@@ -658,6 +800,7 @@ async def capture_site_motion(
             "consent": jank.get("consent"),
             "validation": manifest["validation"],
             "cleanup": cleanup_status,
+            "egress": egress_evidence,
             "artifacts": {
                 "video": {**video_digest},
                 "jank": {**jank_digest},

@@ -12,6 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "remote"))
 import capture_worker as worker
+import egress_boundary
 
 
 def request_payload(root: Path, **overrides):
@@ -50,6 +51,48 @@ def test_normalizes_safe_request_with_reject_default(tmp_path: Path):
     assert request["output_dir"] == tmp_path / "runs" / request["run_id"]
     assert request["jank_check"] is True
     assert request["scroll"] is True
+
+
+def test_namespace_firewall_allows_only_the_allocated_proxy_port(monkeypatch):
+    commands = []
+    monkeypatch.setattr(egress_boundary, "run", lambda command, **_kwargs: commands.append(command))
+
+    egress_boundary._setup_namespace("bu-test", "bvh-test", "bvp-test", "10.200.1.1", "10.200.1.2", "buc_test", 18443)
+
+    proxy_rule = next(command for command in commands if command[:5] == ["nft", "add", "rule", "inet", "buc_test"] and "dport" in command)
+    assert proxy_rule[proxy_rule.index("dport") + 1] == "18443"
+    forward_rule = next(command for command in commands if command[:5] == ["nft", "add", "rule", "inet", "buc_test"] and "forward" in command)
+    assert forward_rule[-1] == "drop"
+
+
+def test_namespace_inode_is_read_from_requested_network_namespace(monkeypatch):
+    calls = []
+
+    class Result:
+        stdout = "123456\n"
+
+    monkeypatch.setattr(egress_boundary, "run", lambda command, **_kwargs: calls.append(command) or Result())
+
+    assert egress_boundary._namespace_inode("bu-1234") == 123456
+    assert calls[0][:4] == ["ip", "netns", "exec", "bu-1234"]
+    assert "os.stat('/proc/self/ns/net').st_ino" in calls[0][-1]
+
+
+def test_link_cleanup_accepts_peer_removal_with_namespace(monkeypatch):
+    commands = []
+
+    class Result:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+    monkeypatch.setattr(
+        egress_boundary,
+        "run",
+        lambda command, **_kwargs: commands.append(command) or Result(1),
+    )
+
+    assert egress_boundary._remove_link("bvh-test") is True
+    assert commands == [["ip", "link", "show", "dev", "bvh-test"]]
 
 
 def test_mobile_mode_uses_reference_viewport(tmp_path: Path):
@@ -412,6 +455,83 @@ def test_consent_aggregation_fails_closed_on_preflight_blind_spot():
 
     assert consent["verified"] is False
     assert consent["blindSpots"][0]["kind"] == "iframe-consent-not-inspected"
+
+
+def test_consent_aggregation_preserves_blind_spots_from_every_phase():
+    consent = worker.combine_consent(
+        "reject",
+        None,
+        {"verified": True, "blindSpots": [], "outcome": "dismissed", "action": "rejected"},
+        [
+            {"verified": False, "blindSpots": [{"kind": "iframe-consent-not-inspected"}]},
+            {"verified": False, "blindSpots": [{"kind": "open-shadow-consent-not-inspected"}]},
+        ],
+    )
+
+    assert consent["verified"] is False
+    assert [item["kind"] for item in consent["blindSpots"]] == [
+        "iframe-consent-not-inspected", "open-shadow-consent-not-inspected",
+    ]
+
+
+def test_explicit_consent_selector_must_have_rejecting_label():
+    class FakeElement:
+        def __init__(self, label):
+            self.label = label
+            self.clicked = False
+
+        async def evaluate(self, expression):
+            if "label:" in expression:
+                return json.dumps({"label": self.label})
+            return True
+
+        async def click(self):
+            self.clicked = True
+
+    accept = FakeElement("Accept all")
+    reject = FakeElement("Reject all")
+
+    class FakePage:
+        async def get_elements_by_css_selector(self, selector):
+            return [accept] if selector == "#accept" else [reject]
+
+    clicked, selector, error = asyncio.run(worker._click_first(
+        FakePage(), ["#accept", "#reject"], worker.REJECT_TEXT_PATTERN,
+        require_scope=False, timeout_ms=100,
+    ))
+
+    assert clicked is True
+    assert selector == "#reject"
+    assert error is None
+    assert accept.clicked is False
+    assert reject.clicked is True
+
+
+def test_reject_mode_is_unverified_when_banner_disappears_without_reject_action(monkeypatch):
+    scans = iter([
+        {"visibleSurfaceCount": 1, "iframeCount": 0, "openShadowHostCount": 0},
+        {"visibleSurfaceCount": 0, "iframeCount": 0, "openShadowHostCount": 0},
+    ])
+
+    async def inspect(*_args):
+        return next(scans)
+
+    async def click(*_args, **_kwargs):
+        return False, None, None
+
+    class FakePage:
+        pass
+
+    monkeypatch.setattr(worker, "_inspect_consent", inspect)
+    monkeypatch.setattr(worker, "_click_first", click)
+    request = {
+        "consent_mode": "reject", "consent_wait_ms": 0, "consent_budget_ms": 500,
+        "consent_selectors": [],
+    }
+    result = asyncio.run(worker.handle_consent(FakePage(), request, "test"))
+
+    assert result["verified"] is False
+    assert result["dismissed"] is False
 
 
 def test_manual_click_cannot_escape_approved_host(tmp_path: Path):
