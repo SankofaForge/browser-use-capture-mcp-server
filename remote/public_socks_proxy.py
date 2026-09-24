@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import contextlib
 import ipaddress
+import json
+import os
+import signal
 import socket
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 
@@ -120,6 +125,13 @@ class PublicSocksProxy:
             and self._reviewed_egress_expires_at is not None
             and self._clock() < self._reviewed_egress_expires_at
         )
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "violations": list(self.violations),
+            "blockedDestinations": list(self.blocked_destinations),
+            "connectionOutcomes": list(self.connection_outcomes),
+        }
 
     async def _resolve_public_address(self, host: str, port: int) -> tuple[str, int]:
         try:
@@ -288,3 +300,40 @@ class PublicSocksProxy:
         for task in pending:
             task.cancel()
         await asyncio.gather(*done, *pending, return_exceptions=True)
+
+
+async def _serve_cli(host: str, port: int, approved_hostname: str, ready_file: str, evidence_file: str) -> None:
+    proxy = PublicSocksProxy(approved_hostname=approved_hostname, host=host)
+    proxy.server = await asyncio.start_server(proxy._handle_client, host, port, limit=65536)
+    proxy.port = port
+    Path(ready_file).write_text("ready\n", encoding="utf-8")
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass
+    try:
+        await stop.wait()
+    finally:
+        await proxy.close()
+        Path(evidence_file).write_text(json.dumps(proxy.evidence()), encoding="utf-8")
+
+
+def _main() -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    serve = subparsers.add_parser("serve")
+    serve.add_argument("--host", required=True)
+    serve.add_argument("--port", required=True, type=int)
+    serve.add_argument("--approved-host", required=True)
+    serve.add_argument("--ready-file", required=True)
+    serve.add_argument("--evidence-file", required=True)
+    args = parser.parse_args()
+    asyncio.run(_serve_cli(args.host, args.port, args.approved_host, args.ready_file, args.evidence_file))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

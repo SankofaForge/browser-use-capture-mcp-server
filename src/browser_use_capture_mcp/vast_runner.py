@@ -32,6 +32,7 @@ BROWSER_USE_RUNTIME_ENV = (
 )
 SSH_URL_PATTERN = re.compile(r"ssh://([^@\s]+)@([^:\s]+):(\d+)")
 MAX_OUTPUT_BYTES = 32 * 1024
+CAPTURE_FINALIZATION_SECONDS = 300
 
 
 class VastRunnerError(RuntimeError):
@@ -262,6 +263,7 @@ class VastRunner:
             self.package_root / "scripts" / "verify_compatibility.py",
             self.package_root / "remote" / "capture_worker.py",
             self.package_root / "remote" / "public_socks_proxy.py",
+            self.package_root / "remote" / "egress_boundary.py",
         ]
         missing = [path.name for path in required if not path.is_file()]
         if missing:
@@ -279,6 +281,7 @@ class VastRunner:
             ([
                 self.package_root / "remote" / "capture_worker.py",
                 self.package_root / "remote" / "public_socks_proxy.py",
+                self.package_root / "remote" / "egress_boundary.py",
             ], "remote"),
         )
         for sources, remote_directory in transfer_groups:
@@ -294,11 +297,21 @@ class VastRunner:
             f"install -d -m 0700 -o {REMOTE_CAPTURE_USER} -g {REMOTE_CAPTURE_USER} "
             f"{_shell_quote(REMOTE_RUNS)} {_shell_quote(REMOTE_ROOT + '/state')}"
         )
+        provision_attestations = (
+            f"install -d -m 0711 -o root -g root {_shell_quote('/workspace/browser-use-capture/attestations')} && "
+            f"test \"$(stat -c '%u:%a' {_shell_quote('/workspace/browser-use-capture/attestations')})\" = '0:711'"
+        )
         await self._run_remote(
             connection,
             provision_capture_user,
             timeout=30,
             error_code="capture-user-provision-failed",
+        )
+        await self._run_remote(
+            connection,
+            provision_attestations,
+            timeout=30,
+            error_code="capture-attestation-provision-failed",
         )
         provision_runtime = (
             f"install -d -m 0755 -o root -g root {_shell_quote(REMOTE_RUNTIME)} "
@@ -399,6 +412,19 @@ class VastRunner:
         ]
         await self._run_local(command, timeout=90, error_code="capture-artifact-transfer-failed")
 
+    async def _copy_remote_files(self, connection: VastConnection, remote_paths: list[str], local_directory: Path) -> None:
+        if not remote_paths or any(
+            not re.fullmatch(r"/workspace/browser-use-capture/runs/[0-9a-f-]{36}/[A-Za-z0-9._-]{1,120}", path)
+            for path in remote_paths
+        ):
+            raise VastRunnerError("capture-artifact-transfer-failed", "The remote artifact list is invalid")
+        command = [
+            "scp", "-p", *self._ssh_options(), "-P", str(connection.port),
+            *(f"{connection.user}@{connection.host}:{path}" for path in remote_paths),
+            str(local_directory) + "/",
+        ]
+        await self._run_local(command, timeout=270, error_code="capture-artifact-transfer-failed")
+
     async def _terminate_remote_run(self, connection: VastConnection, run_directory: str) -> None:
         if not re.fullmatch(r"/workspace/browser-use-capture/runs/[0-9a-f-]{36}", run_directory):
             return
@@ -443,14 +469,19 @@ class VastRunner:
         worker_command = (
             f"cd {_shell_quote(run_directory)}; "
             "set +e; "
-            f"runuser -u {REMOTE_CAPTURE_USER} -- env "
-            f"HOME={_shell_quote(run_directory + '/home')} "
-            f"TMPDIR={_shell_quote(run_directory + '/tmp')} "
-            f"UV_CACHE_DIR={_shell_quote(run_directory + '/uv-cache')} "
-            f"{self._browser_environment()} "
-            f"{_shell_quote(REMOTE_VENV + '/bin/python')} {_shell_quote(REMOTE_APP + '/remote/capture_worker.py')} "
-            f"< {_shell_quote(remote_input)} "
-            f"> {_shell_quote(remote_result)} 2> {_shell_quote(run_directory + '/worker.log')}; "
+            f"{_shell_quote(REMOTE_PYTHON)} {_shell_quote(REMOTE_APP + '/remote/egress_boundary.py')} capture "
+            f"--run-id {_shell_quote(run_id)} "
+            f"--run-directory {_shell_quote(run_directory)} "
+            f"--input {_shell_quote(remote_input)} "
+            f"--result {_shell_quote(remote_result)} "
+            f"--runner-id {_shell_quote(self.instance_id)} "
+            f"--browser {_shell_quote(self.browser_path)} "
+            "--browser-use-version 0.13.10 "
+            f"--capture-user {_shell_quote(REMOTE_CAPTURE_USER)} "
+            f"--python {_shell_quote(REMOTE_VENV + '/bin/python')} "
+            f"--worker {_shell_quote(REMOTE_APP + '/remote/capture_worker.py')} "
+            f"--timeout {capture['timeout_ms'] // 1000} "
+            f"> {_shell_quote(run_directory + '/boundary.log')} 2>&1; "
             "code=$?; "
             f"printf '%s\\n' \"$code\" > {_shell_quote(remote_exit)}; "
             "exit \"$code\""
@@ -478,7 +509,7 @@ class VastRunner:
             )
             await self._run_remote(connection, launch_command, timeout=20, error_code="capture-launch-failed")
             wait_command = (
-                f"for attempt in $(seq 1 {max(1, capture['timeout_ms'] // 1000 + 20)}); do "
+                f"for attempt in $(seq 1 {max(1, capture['timeout_ms'] // 1000 + CAPTURE_FINALIZATION_SECONDS + 20)}); do "
                 f"test -f {_shell_quote(remote_exit)} && break; sleep 1; done; "
                 f"test -f {_shell_quote(remote_exit)} || exit 124; "
                 f"cat {_shell_quote(remote_exit)}; "
@@ -487,7 +518,7 @@ class VastRunner:
             stdout, _ = await self._run_remote(
                 connection,
                 wait_command,
-                timeout=capture["timeout_ms"] / 1000 + 30,
+                timeout=capture["timeout_ms"] / 1000 + CAPTURE_FINALIZATION_SECONDS + 30,
                 error_code="capture-worker-failed",
             )
             lines = stdout.decode("utf-8", errors="replace").splitlines()
@@ -497,10 +528,45 @@ class VastRunner:
             result = self._last_json_line("\n".join(lines[1:]).encode())
             if exit_code != 0 and result.get("status") not in {"blocked", "partial"}:
                 raise VastRunnerError("capture-worker-failed", "The remote capture worker failed", _safe_output(result.get("failureReason", "")))
-            if result.get("status") == "blocked":
-                return result
-            for remote_path in (remote_manifest, remote_video, remote_jank):
-                await self._copy_remote_file(connection, remote_path, local_stage / Path(remote_path).name)
+            artifact_names = result.get("artifacts") if isinstance(result.get("artifacts"), dict) else {}
+            allowed_names = {
+                "manifest": "manifest.json",
+                "webm": f"{capture['name']}.webm",
+                "jank": f"{capture['name']}.jank.json",
+            }
+            remote_paths = []
+            transferred: dict[str, str] = {}
+            for key, expected_name in allowed_names.items():
+                reported_name = artifact_names.get(key)
+                if reported_name != expected_name:
+                    continue
+                remote_path = f"{run_directory}/{expected_name}"
+                exists, _ = await self._run_remote(
+                    connection,
+                    f"if test -f {_shell_quote(remote_path)} && test ! -L {_shell_quote(remote_path)}; then printf present; else printf absent; fi",
+                    timeout=15,
+                    error_code="capture-artifact-transfer-failed",
+                )
+                if exists.strip() == b"present":
+                    remote_paths.append(remote_path)
+                    transferred[key] = expected_name
+            if remote_paths:
+                try:
+                    await self._copy_remote_files(connection, remote_paths, local_stage)
+                except VastRunnerError as error:
+                    transferred = {
+                        key: filename for key, filename in transferred.items()
+                        if (local_stage / filename).is_file() and not (local_stage / filename).is_symlink()
+                    }
+                    previous_reason = result.get("failureReason")
+                    result["status"] = "partial"
+                    result["reasonCode"] = "capture-artifact-transfer-failed"
+                    result["failureReason"] = _safe_output(
+                        f"{previous_reason or 'capture evidence incomplete'}; artifact transfer failed: {error}"
+                    )
+                    result["localArtifacts"] = transferred
+                    return result
+            result["localArtifacts"] = transferred
             return result
         except asyncio.CancelledError:
             termination = asyncio.create_task(self._terminate_remote_run(connection, run_directory))

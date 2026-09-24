@@ -5,6 +5,7 @@ import hashlib
 import json
 import socket
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from browser_use_capture_mcp.server import (
     _browser_use_compatibility_gate,
     _issue_capability_record,
     _validate_capture_input,
+    _validate_egress_attestation,
     _verified_capability,
     artifact_digest,
     cleanup_run_directory,
@@ -144,6 +146,28 @@ def test_private_dns_answer_is_rejected(monkeypatch):
         _validate_capture_input({"url": "https://example.com"})
 
 
+def test_public_capture_bounds_match_remote_worker_contract(monkeypatch):
+    _public_dns(monkeypatch)
+    capture = _validate_capture_input({
+        "url": "https://example.com",
+        "width": 7680,
+        "height": 4320,
+        "scroll_distance": 1_000_000,
+        "scroll_step": 4000,
+        "scroll_pause_ms": 10000,
+        "tail_lines": 30000,
+        "consent_budget_ms": 30000,
+        "timeout_ms": 270000,
+    })
+    assert capture["width"] == 7680
+    assert capture["height"] == 4320
+    assert capture["scroll_distance"] == 1_000_000
+    assert capture["timeout_ms"] == 270000
+
+    with pytest.raises(ValueError, match="270000"):
+        _validate_capture_input({"url": "https://example.com", "timeout_ms": 270001})
+
+
 def test_artifact_digest_is_stable(tmp_path: Path):
     path = tmp_path / "capture.jank.json"
     path.write_text('{"schemaVersion":"jank-report.v1"}', encoding="utf-8")
@@ -169,7 +193,7 @@ def test_validate_media_accepts_ffprobe_webm_result(tmp_path: Path, monkeypatch)
     path.write_bytes(bytes.fromhex("1a45dfa3") + b"fixture")
     fake = tmp_path / "ffprobe"
     fake.write_text(
-        "#!/bin/sh\nprintf '%s' '{\"format\":{\"format_name\":\"matroska,webm\",\"duration\":\"2.5\"}}'\n",
+        "#!/bin/sh\nprintf '%s' '{\"format\":{\"format_name\":\"matroska,webm\",\"duration\":\"2.5\"},\"streams\":[{\"codec_type\":\"video\"}]}'\n",
         encoding="utf-8",
     )
     fake.chmod(0o755)
@@ -177,6 +201,20 @@ def test_validate_media_accepts_ffprobe_webm_result(tmp_path: Path, monkeypatch)
     result = validate_media(path)
     assert result["status"] == "valid"
     assert result["durationSeconds"] == 2.5
+    assert result["videoStreamCount"] == 1
+
+
+def test_validate_media_rejects_webm_without_video_stream(tmp_path: Path, monkeypatch):
+    path = tmp_path / "capture.webm"
+    path.write_bytes(bytes.fromhex("1a45dfa3") + b"fixture")
+    fake = tmp_path / "ffprobe"
+    fake.write_text(
+        "#!/bin/sh\nprintf '%s' '{\"format\":{\"format_name\":\"matroska,webm\",\"duration\":\"2.5\"},\"streams\":[]}'\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{__import__('os').environ['PATH']}")
+    assert validate_media(path)["status"] == "blocked"
 
 
 def test_capability_is_bound_to_runner_and_expires(monkeypatch):
@@ -196,6 +234,56 @@ def test_capability_is_bound_to_runner_and_expires(monkeypatch):
     _CAPABILITY_RECORDS[capability_id]["created_at"] = time.time() - CAPABILITY_TTL_SECONDS - 1
     monkeypatch.setenv("VAST_INSTANCE_ID", "52085190")
     assert _verified_capability(capability_id, VastRunner())["reasonCode"] == "gpu-check-expired"
+
+
+def test_egress_attestation_requires_fresh_bound_namespace_and_proxy_proof(monkeypatch):
+    runner = _configured_runner(monkeypatch)
+    now = datetime.now(timezone.utc)
+    host = "example.com"
+    port = 443
+    attestation = {
+        "schemaVersion": "runner-egress-boundary.v1",
+        "boundaryId": "boundary-123",
+        "runId": "aa44ec52-ae57-4c73-a574-e824ac649e37",
+        "checkedAt": now.isoformat().replace("+00:00", "Z"),
+        "expiresAt": (now + timedelta(seconds=90)).isoformat().replace("+00:00", "Z"),
+        "runnerInstanceId": runner.instance_id,
+        "browserExecutable": runner.browser_path,
+        "browserVersion": "123.4.5.6",
+        "captureRuntime": "browser-use",
+        "captureRuntimeVersion": "0.13.10",
+        "browserUseVersion": "0.13.10",
+        "approvedHost": host,
+        "networkNamespaceInode": 456,
+        "directEgressBlocked": True,
+        "proxyPolicy": "capture-exact-host.v1",
+        "controls": {"direct": {"status": "blocked"}, "proxied": {"status": "passed"}},
+        "proxyEvidence": {
+            "violations": [],
+            "connectionOutcomes": [{"hostname": host, "port": port, "outcome": "connected", "count": 1}],
+        },
+        "cleanupVerified": True,
+    }
+    summary = {
+        "status": "verified",
+        "boundaryId": "boundary-123",
+        "directEgressBlocked": True,
+        "approvedProxyProbe": True,
+        "proxyPolicy": "capture-exact-host.v1",
+        "approvedHost": host,
+        "networkNamespaceInode": 456,
+        "cleanupVerified": True,
+    }
+    evidence = {"egress": summary, "egressAttestation": attestation, "runtime": {"browserUseVersion": "0.13.10", "browserVersion": "123.4.5.6"}}
+    capture = {"url": "https://example.com/page"}
+
+    checked, proof = _validate_egress_attestation(evidence, capture=capture, run_id=attestation["runId"], runner=runner)
+    assert checked["approvedProxyProbe"] is True
+    assert proof["networkNamespaceInode"] == 456
+
+    attestation["controls"]["direct"]["status"] = "passed"
+    with pytest.raises(ValueError, match="stale, unbound, or incomplete"):
+        _validate_egress_attestation(evidence, capture=capture, run_id=attestation["runId"], runner=runner)
 
 
 def test_remote_manifest_requires_exact_hashed_evidence(tmp_path: Path):

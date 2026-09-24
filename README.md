@@ -114,6 +114,27 @@ gate. A fresh
 `gpu_check_id` requires all three results to pass and must bind to the runner,
 browser executable, and Browser Use release.
 
+## Per-capture network boundary
+
+Each authoritative capture starts in a fresh Linux network namespace. The
+runner creates a veth pair and an nftables policy that permits the namespace
+to reach only the host-side exact-host SOCKS proxy; forwarding other traffic
+from the namespace is dropped. The proxy resolves the approved hostname,
+rejects non-public DNS answers, and pins its upstream connection to a checked
+public address. Chrome and its child processes must share the attested network
+namespace. The worker checks that namespace identity before capture, then the
+runner repeats the direct-denial and approved-proxy controls after capture.
+
+Runner provisioning requires root SSH access, `ip` from iproute2, `nft`, Linux
+network-namespace and veth support, and permission to install nftables input
+and forwarding rules. If any prerequisite or control fails, the worker returns
+`blocked` or `partial`; it does not issue complete evidence. The privileged
+runner writes the read-only proof named by remote
+`CAPTURE_EGRESS_ATTESTATION_FILE`. The worker validates the runner, executable,
+browser and Browser Use versions, approved hostname, namespace inode, direct
+and proxied controls, and a maximum 120-second proof lease. The local adapter
+copies the validated proof into `capture-cell.v2` evidence.
+
 ## Recover from a startup timeout
 
 1. Resolve the active Vast-managed SSH endpoint and confirm the configured
