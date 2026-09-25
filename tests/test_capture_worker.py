@@ -57,12 +57,38 @@ def test_namespace_firewall_allows_only_the_allocated_proxy_port(monkeypatch):
     commands = []
     monkeypatch.setattr(egress_boundary, "run", lambda command, **_kwargs: commands.append(command))
 
-    egress_boundary._setup_namespace("bu-test", "bvh-test", "bvp-test", "10.200.1.1", "10.200.1.2", "buc_test", 18443)
+    egress_boundary._setup_namespace(
+        "bu-test", "bvh-test", "bvp-test", "10.200.1.1", "10.200.1.2",
+        "buc_test", "buc_c_test", 18443,
+    )
 
     proxy_rule = next(command for command in commands if command[:5] == ["nft", "add", "rule", "inet", "buc_test"] and "dport" in command)
     assert proxy_rule[proxy_rule.index("dport") + 1] == "18443"
     forward_rule = next(command for command in commands if command[:5] == ["nft", "add", "rule", "inet", "buc_test"] and "forward" in command)
     assert forward_rule[-1] == "drop"
+    client_proxy_rule = next(
+        command for command in commands
+        if command[:5] == ["ip", "netns", "exec", "bu-test", "nft"]
+        and "dport" in command
+    )
+    assert client_proxy_rule[client_proxy_rule.index("dport") + 1] == "18443"
+    client_drop_rule = next(
+        command for command in commands
+        if command[:5] == ["ip", "netns", "exec", "bu-test", "nft"]
+        and "counter" in command
+    )
+    assert client_drop_rule[-1] == "drop"
+
+
+def test_compatibility_requires_network_namespace_capabilities():
+    assert egress_boundary._boundary_capability_failure("CapEff:\t0000000000000000\n") == (
+        "required Linux capabilities unavailable: CAP_NET_ADMIN, CAP_SYS_ADMIN"
+    )
+    granted = (1 << 12) | (1 << 21)
+    assert egress_boundary._boundary_capability_failure(f"CapEff:\t{granted:x}\n") is None
+    assert egress_boundary._boundary_capability_failure("Status without capability mask") == (
+        "effective Linux capabilities could not be verified"
+    )
 
 
 def test_namespace_inode_is_read_from_requested_network_namespace(monkeypatch):
@@ -76,6 +102,255 @@ def test_namespace_inode_is_read_from_requested_network_namespace(monkeypatch):
     assert egress_boundary._namespace_inode("bu-1234") == 123456
     assert calls[0][:4] == ["ip", "netns", "exec", "bu-1234"]
     assert "os.stat('/proc/self/ns/net').st_ino" in calls[0][-1]
+
+
+def test_namespace_egress_drop_counter_is_read_from_client_output_chain(monkeypatch):
+    class Result:
+        returncode = 0
+        stdout = json.dumps({
+            "nftables": [{
+                "rule": {
+                    "chain": "output",
+                    "expr": [{"counter": {"packets": 3, "bytes": 150}}],
+                },
+            }],
+        })
+
+    calls = []
+    monkeypatch.setattr(egress_boundary, "run", lambda command, **_kwargs: calls.append(command) or Result())
+
+    assert egress_boundary._namespace_egress_drop_packets("bu-test", "buc_c_test") == 3
+    assert calls[0][0:5] == ["ip", "netns", "exec", "bu-test", "nft"]
+    assert calls[0][-2:] == ["buc_c_test", "output"]
+
+
+def test_browser_namespace_observer_uses_the_run_scoped_profile_marker(tmp_path):
+    browser = tmp_path / "chrome"
+    browser.write_bytes(b"browser")
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    expected_inode = None
+    marked_inode = None
+    profile_marker = "/tmp/buc-0123456789abcdef-"
+    for pid, parent, executable, arguments, namespace in (
+        (10, 1, "python", ["python", "probe.py"], 100),
+        (11, 10, str(browser), [str(browser), "--remote-debugging-port=9222"], 101),
+        (12, 11, str(browser), [str(browser), "--type=renderer"], 102),
+        (13, 1, str(browser), [str(browser)], 103),
+        (14, 1, str(browser), [str(browser), f"--user-data-dir={profile_marker}random/profile"], 104),
+    ):
+        process_path = proc_root / str(pid)
+        process_path.mkdir()
+        (process_path / "stat").write_text(f"{pid} (test process) S {parent} 0 0\n", encoding="utf-8")
+        (process_path / "cmdline").write_bytes(b"\0".join(item.encode() for item in arguments))
+        (process_path / "exe").symlink_to(executable)
+        namespace_file = process_path / "ns"
+        namespace_file.mkdir()
+        namespace_target = tmp_path / f"net-{namespace}"
+        namespace_target.write_text(str(namespace), encoding="utf-8")
+        (namespace_file / "net").symlink_to(namespace_target)
+        if pid == 11:
+            expected_inode = namespace_target.stat().st_ino
+        elif pid == 14:
+            marked_inode = namespace_target.stat().st_ino
+
+    inodes = egress_boundary._browser_process_namespace_inodes(10, str(browser), proc_root)
+    marked_inodes = egress_boundary._browser_process_namespace_inodes(
+        10,
+        str(browser),
+        proc_root,
+        profile_marker=profile_marker,
+    )
+
+    assert inodes == [expected_inode]
+    assert marked_inodes == [marked_inode]
+
+
+def test_direct_egress_requires_a_packet_drop_counter_increment(monkeypatch):
+    drops = iter([4, 5])
+    monkeypatch.setattr(egress_boundary, "_namespace_egress_drop_packets", lambda *_args: next(drops))
+
+    def fake_run(command, **_kwargs):
+        result = subprocess.CompletedProcess(command, 0, stdout="blocked\n" if command[-5] == "direct" else "passed\n")
+        return result
+
+    monkeypatch.setattr(egress_boundary, "run", fake_run)
+
+    result = egress_boundary._probe("bu-test", "10.200.1.1", 18443, "example.com", 443, "buc_c_test")
+
+    assert result == {"direct": "blocked", "proxied": "passed"}
+
+
+def test_direct_socket_error_without_drop_evidence_does_not_verify_boundary(monkeypatch):
+    drops = iter([4, 4])
+    monkeypatch.setattr(egress_boundary, "_namespace_egress_drop_packets", lambda *_args: next(drops))
+
+    def fake_run(command, **_kwargs):
+        output = "blocked\n" if command[-5] == "direct" else "passed\n"
+        return subprocess.CompletedProcess(command, 0, stdout=output)
+
+    monkeypatch.setattr(egress_boundary, "run", fake_run)
+
+    result = egress_boundary._probe("bu-test", "10.200.1.1", 18443, "example.com", 443, "buc_c_test")
+
+    assert result == {"direct": "passed", "proxied": "passed"}
+
+
+def test_compatibility_egress_blocks_when_service_evidence_is_incomplete():
+    result = {
+        "status": "blocked",
+        "cpu": {"status": "verified"},
+        "gpu": {"status": "verified"},
+        "egressPolicy": {"browserNetworkNamespaceInode": 999},
+    }
+
+    finalized = egress_boundary._finalize_compatibility_egress(
+        result,
+        controls_before={"direct": "blocked", "proxied": "passed"},
+        controls_after={"direct": "blocked", "proxied": "passed"},
+        proxy_evidence={
+            "violations": [],
+            "blockedDestinations": [],
+            "connectionOutcomes": [{
+                "hostname": "example.com",
+                "port": 443,
+                "outcome": "connected",
+                "count": 1,
+            }],
+        },
+        approved_host="example.com",
+        approved_port=443,
+        namespace_inode=456,
+        browser_namespace_inodes=[456],
+        cleanup_verified=True,
+    )
+
+    assert finalized["status"] == "blocked"
+    assert finalized["egressPolicy"]["status"] == "blocked"
+    assert finalized["egressPolicy"]["proxyPolicyCheck"] == "verified"
+    assert finalized["egressPolicy"]["browserTrafficBoundary"] == "verified"
+    assert finalized["egressPolicy"]["browserNetworkNamespaceInode"] == 456
+    assert finalized["egressPolicy"]["browserProcessNamespaceMatch"] is True
+    assert finalized["egressPolicy"]["browserServiceReachability"] == "blocked"
+    assert finalized["failureReason"] == "Browser Safe Browsing and component updater checks did not both pass."
+
+
+def test_compatibility_egress_verifies_both_services_from_browser_and_proxy_evidence():
+    hosts = sorted(egress_boundary.COMPATIBILITY_SERVICE_HOSTS)
+    outcomes = [{"hostname": "example.com", "port": 443, "outcome": "connected", "count": 1}]
+    outcomes.extend({"hostname": host, "port": 443, "outcome": "connected", "count": 1} for host in hosts)
+    finalized = egress_boundary._finalize_compatibility_egress(
+        {
+            "status": "blocked",
+            "cpu": {"status": "verified"},
+            "gpu": {"status": "verified"},
+            "browserServiceChecks": {"status": "verified", "checks": [
+                {"service": "safeBrowsing", "status": "verified"},
+                {"service": "componentUpdater", "status": "verified"},
+            ]},
+            "egressPolicy": {},
+        },
+        controls_before={"direct": "blocked", "proxied": "passed"},
+        controls_after={"direct": "blocked", "proxied": "passed"},
+        proxy_evidence={"violations": [], "blockedDestinations": [], "connectionOutcomes": outcomes},
+        approved_host="example.com",
+        approved_port=443,
+        namespace_inode=456,
+        browser_namespace_inodes=[456],
+        cleanup_verified=True,
+    )
+    assert finalized["status"] == "verified"
+    assert finalized["egressPolicy"]["browserServiceReachability"] == "verified"
+    assert all(item["outcome"] == "connected" for item in finalized["egressPolicy"]["browserServiceOutcomes"])
+
+
+def test_compatibility_egress_rejects_mismatched_namespace_evidence():
+    finalized = egress_boundary._finalize_compatibility_egress(
+        {
+            "status": "blocked",
+            "cpu": {"status": "verified"},
+            "gpu": {"status": "verified"},
+            "egressPolicy": {"browserNetworkNamespaceInode": 456},
+        },
+        controls_before={"direct": "blocked", "proxied": "passed"},
+        controls_after={"direct": "blocked", "proxied": "passed"},
+        proxy_evidence={
+            "violations": [],
+            "blockedDestinations": [],
+            "connectionOutcomes": [{
+                "hostname": "example.com",
+                "port": 443,
+                "outcome": "connected",
+                "count": 1,
+            }],
+        },
+        approved_host="example.com",
+        approved_port=443,
+        namespace_inode=456,
+        browser_namespace_inodes=[123],
+        cleanup_verified=True,
+    )
+
+    assert finalized["egressPolicy"]["status"] == "blocked"
+    assert finalized["egressPolicy"]["browserTrafficBoundary"] == "blocked"
+    assert finalized["egressPolicy"]["browserProcessNamespaceMatch"] is False
+
+
+def test_compatibility_egress_rejects_unapproved_proxy_connection():
+    finalized = egress_boundary._finalize_compatibility_egress(
+        {
+            "status": "blocked",
+            "cpu": {"status": "verified"},
+            "gpu": {"status": "verified"},
+            "egressPolicy": {"browserNetworkNamespaceInode": 456},
+        },
+        controls_before={"direct": "blocked", "proxied": "passed"},
+        controls_after={"direct": "blocked", "proxied": "passed"},
+        proxy_evidence={
+            "violations": [],
+            "blockedDestinations": [],
+            "connectionOutcomes": [
+                {"hostname": "example.com", "port": 443, "outcome": "connected", "count": 1},
+                {"hostname": "unauthorized.example", "port": 443, "outcome": "connected", "count": 1},
+            ],
+        },
+        approved_host="example.com",
+        approved_port=443,
+        namespace_inode=456,
+        browser_namespace_inodes=[456],
+        cleanup_verified=True,
+    )
+
+    assert finalized["egressPolicy"]["status"] == "blocked"
+    assert finalized["egressPolicy"]["proxyPolicyCheck"] == "blocked"
+    assert finalized["egressPolicy"]["unauthorizedConnections"] == [{
+        "hostname": "unauthorized.example",
+        "port": 443,
+        "outcome": "connected",
+        "count": 1,
+    }]
+
+
+def test_compatibility_probe_environment_uses_short_temporary_paths(monkeypatch):
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(egress_boundary, "run", fake_run)
+    root, environment = egress_boundary._short_probe_environment("browser-capture")
+    try:
+        assert root.parent == Path("/tmp")
+        assert all(Path(path).parent == root for path in environment.values())
+        assert all(len(path) <= 32 for path in environment.values())
+        assert commands == [[
+            "install", "-d", "-m", "0700", "-o", "browser-capture", "-g", "browser-capture",
+            *environment.values(),
+        ]]
+    finally:
+        root.chmod(0o700)
+        egress_boundary.shutil.rmtree(root, ignore_errors=True)
 
 
 def test_link_cleanup_accepts_peer_removal_with_namespace(monkeypatch):

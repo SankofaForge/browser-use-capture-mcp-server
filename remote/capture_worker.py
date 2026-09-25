@@ -26,6 +26,7 @@ import tempfile
 import time
 import uuid
 from collections import deque
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -776,10 +777,61 @@ def _clean_chrome_args(
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--disable-sync",
         "--disable-default-apps",
+        "--disable-notifications",
+        "--disable-features=NetworkTimeServiceQuerying,OptimizationHints,OptimizationGuideModelDownloading,OptimizationGuidePersonalizedFetching,GCM,PushMessaging",
+        "--disable-search-engine-choice-screen",
+        "--gcm-mcs-endpoint=https://android.clients.google.com:443",
+        "--gcm-checkin-url=https://android.clients.google.com/checkin",
         "--no-default-browser-check",
         "--no-first-run",
         "data:text/html,",
     ]
+
+
+def _seed_profile_preflight_assets(profile_dir: Path) -> None:
+    cache_root = Path("/workspace/browser-use-capture/component-cache")
+    if not cache_root.is_dir():
+        cache_root = Path(__file__).resolve().parent / "component-cache"
+
+    dict_cache = cache_root / "Dictionaries"
+    if dict_cache.is_dir():
+        shutil.copytree(dict_cache, profile_dir / "Dictionaries", dirs_exist_ok=True)
+
+    og_cache = cache_root / "OptimizationGuideModelsManifest"
+    pv = "1.20260913.2"
+    if og_cache.is_dir():
+        shutil.copytree(og_cache, profile_dir / "OptimizationGuideModelsManifest", dirs_exist_ok=True)
+        versions = [d.name for d in (profile_dir / "OptimizationGuideModelsManifest").iterdir() if d.is_dir()]
+        if versions:
+            pv = sorted(versions)[-1]
+    else:
+        manifest_dir = profile_dir / "OptimizationGuideModelsManifest" / pv
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "manifest_version": 2,
+            "name": "Optimization Guide On Device Model",
+            "version": pv,
+        }
+        (manifest_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    local_state_file = profile_dir / "Local State"
+    local_state: dict[str, Any] = {}
+    if local_state_file.is_file():
+        with suppress(Exception):
+            local_state = json.loads(local_state_file.read_text(encoding="utf-8"))
+
+    updateclientdata = local_state.setdefault("updateclientdata", {}).setdefault("apps", {})
+    updateclientdata["ceofaddefefcbblgcgnibnonglccbfja"] = {
+        "cohort": "1:3mcl:",
+        "cohortname": "Auto",
+        "dlrc": 7207,
+        "fp": "",
+        "installdate": 7207,
+        "max_pv": "0.0.0.0",
+        "pf": "c9cdcead-7ebc-4013-a77e-a58ef4b16de0",
+        "pv": pv,
+    }
+    local_state_file.write_text(json.dumps(local_state), encoding="utf-8")
 
 
 def _browser_profile_options(
@@ -1820,6 +1872,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
 
     try:
         profile_dir.mkdir()
+        _seed_profile_preflight_assets(profile_dir)
         cdp_port = reserve_loopback_port()
         cdp_origin = f"http://127.0.0.1:{cdp_port}"
         async with asyncio.timeout(request["timeout_ms"] / 1000):

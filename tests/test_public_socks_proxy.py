@@ -7,6 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "remote"))
 from public_socks_proxy import (
+    COMPATIBILITY_SERVICE_HOSTS,
     REVIEWED_EGRESS_HOSTS,
     REVIEWED_EGRESS_TTL_SECONDS,
     EgressPolicyError,
@@ -85,6 +86,7 @@ def test_reviewed_egress_experiment_allows_only_two_exact_https_hosts():
         for hostname in REVIEWED_EGRESS_HOSTS:
             assert await proxy._resolve_public_address(hostname, 443) == ("1.1.1.1", 4)
         for hostname, port in (
+            ("example.com", 80),
             ("www.gstatic.com", 80),
             ("update.googleapis.com", 80),
             ("sub.www.gstatic.com", 443),
@@ -126,6 +128,8 @@ def test_reviewed_egress_experiment_expires_after_one_hour():
 def test_reviewed_egress_flag_defaults_to_disabled():
     async def run():
         proxy = PublicSocksProxy(approved_hostname="site.example")
+        assert proxy._destination_is_approved("site.example", 443)
+        assert not any(proxy._destination_is_approved(hostname, 443) for hostname in COMPATIBILITY_SERVICE_HOSTS)
         await proxy.start()
         try:
             reply = await _request_connect(proxy, "www.gstatic.com", 443)
@@ -141,6 +145,43 @@ def test_reviewed_egress_flag_defaults_to_disabled():
             await proxy.close()
 
     asyncio.run(run())
+
+
+def test_compatibility_services_are_exact_hosts_on_https_only():
+    async def run():
+        proxy = PublicSocksProxy(
+            approved_hostname="example.com",
+            compatibility_service_hosts=COMPATIBILITY_SERVICE_HOSTS,
+            resolver=_records(["1.1.1.1"]),
+        )
+        for hostname in COMPATIBILITY_SERVICE_HOSTS:
+            assert await proxy._resolve_public_address(hostname, 443) == ("1.1.1.1", 4)
+        for hostname, port in (
+            ("www.gstatic.com", 80),
+            ("sub.www.gstatic.com", 443),
+            ("google.fastly-edge.com", 443),
+            ("unexpected.example", 443),
+        ):
+            try:
+                await proxy._resolve_public_address(hostname, port)
+            except EgressPolicyError as error:
+                assert error.reason_code == "domain-not-approved"
+            else:
+                raise AssertionError(f"unexpectedly approved {hostname}:{port}")
+
+    asyncio.run(run())
+
+
+def test_compatibility_proxy_rejects_host_outside_fixed_set():
+    try:
+        PublicSocksProxy(
+            approved_hostname="example.com",
+            compatibility_service_hosts={"unexpected.example"},
+        )
+    except ValueError as error:
+        assert "fixed service set" in str(error)
+    else:
+        raise AssertionError("compatibility proxy accepted an unreviewed service host")
 
 
 def test_connection_outcomes_are_aggregated_without_request_data():
@@ -230,5 +271,25 @@ def test_client_disconnect_before_socks_handshake_is_not_an_egress_violation():
             assert proxy.violations == []
         finally:
             await proxy.close()
+
+    asyncio.run(run())
+
+
+def test_client_reset_before_socks_handshake_is_not_an_egress_violation():
+    class ResetReader:
+        async def readexactly(self, _count):
+            raise ConnectionResetError("client closed")
+
+    class ClosedWriter:
+        def close(self):
+            return None
+
+        async def wait_closed(self):
+            return None
+
+    async def run():
+        proxy = PublicSocksProxy(approved_hostname="site.example")
+        await proxy._handle_client(ResetReader(), ClosedWriter())
+        assert proxy.violations == []
 
     asyncio.run(run())

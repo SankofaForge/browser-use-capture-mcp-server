@@ -18,6 +18,18 @@ from typing import Any
 
 REVIEWED_EGRESS_HOSTS = frozenset({"www.gstatic.com", "update.googleapis.com"})
 REVIEWED_EGRESS_TTL_SECONDS = 60 * 60
+COMPATIBILITY_SERVICE_HOSTS = frozenset({
+    "accounts.google.com",
+    "android.clients.google.com",
+    "dl.google.com",
+    "edgedl.me.gvt1.com",
+    "ohttp-relay-safebrowsing-chrome.google.fastly-edge.com",
+    "redirector.gvt1.com",
+    "safebrowsing.googleapis.com",
+    "update.googleapis.com",
+    "www.google.com",
+    "www.gstatic.com",
+})
 
 
 class EgressPolicyError(RuntimeError):
@@ -32,6 +44,7 @@ class PublicSocksProxy:
         *,
         approved_hostname: str,
         reviewed_egress_experiment: bool = False,
+        compatibility_service_hosts: frozenset[str] | set[str] = frozenset(),
         resolver: Callable[..., list[tuple[Any, ...]]] = socket.getaddrinfo,
         clock: Callable[[], float] = time.monotonic,
         host: str = "127.0.0.1",
@@ -48,6 +61,16 @@ class PublicSocksProxy:
             raise ValueError("reviewed egress experiment flag must be boolean")
         self._clock = clock
         self.reviewed_egress_experiment = reviewed_egress_experiment
+        try:
+            normalized_service_hosts = frozenset(
+                hostname.encode("idna").decode("ascii").lower().rstrip(".")
+                for hostname in compatibility_service_hosts
+            )
+        except (AttributeError, UnicodeError) as error:
+            raise ValueError("compatibility service host is invalid") from error
+        if not normalized_service_hosts.issubset(COMPATIBILITY_SERVICE_HOSTS):
+            raise ValueError("compatibility service host is not in the fixed service set")
+        self.compatibility_service_hosts = normalized_service_hosts
         self._reviewed_egress_expires_at = (
             self._clock() + REVIEWED_EGRESS_TTL_SECONDS
             if reviewed_egress_experiment
@@ -117,7 +140,11 @@ class PublicSocksProxy:
 
     def _destination_is_approved(self, hostname: str, port: int) -> bool:
         if hostname == self.approved_hostname:
-            return port in {80, 443}
+            return port == 443 if self.compatibility_service_hosts else port in {80, 443}
+        if hostname in self.compatibility_service_hosts:
+            if hostname == "edgedl.me.gvt1.com":
+                return port in {80, 443}
+            return port == 443
         return (
             self.reviewed_egress_experiment
             and hostname in REVIEWED_EGRESS_HOSTS
@@ -252,6 +279,8 @@ class PublicSocksProxy:
             self._record_violation(error.reason_code)
         except asyncio.IncompleteReadError:
             pass
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            pass
         except (asyncio.LimitOverrunError, OSError, asyncio.TimeoutError):
             self._record_violation("incomplete-socks-request")
         finally:
@@ -302,8 +331,19 @@ class PublicSocksProxy:
         await asyncio.gather(*done, *pending, return_exceptions=True)
 
 
-async def _serve_cli(host: str, port: int, approved_hostname: str, ready_file: str, evidence_file: str) -> None:
-    proxy = PublicSocksProxy(approved_hostname=approved_hostname, host=host)
+async def _serve_cli(
+    host: str,
+    port: int,
+    approved_hostname: str,
+    ready_file: str,
+    evidence_file: str,
+    compatibility_service_hosts: frozenset[str] = frozenset(),
+) -> None:
+    proxy = PublicSocksProxy(
+        approved_hostname=approved_hostname,
+        compatibility_service_hosts=compatibility_service_hosts,
+        host=host,
+    )
     proxy.server = await asyncio.start_server(proxy._handle_client, host, port, limit=65536)
     proxy.port = port
     Path(ready_file).write_text("ready\n", encoding="utf-8")
@@ -328,10 +368,18 @@ def _main() -> int:
     serve.add_argument("--host", required=True)
     serve.add_argument("--port", required=True, type=int)
     serve.add_argument("--approved-host", required=True)
+    serve.add_argument("--compatibility-service-host", action="append", default=[])
     serve.add_argument("--ready-file", required=True)
     serve.add_argument("--evidence-file", required=True)
     args = parser.parse_args()
-    asyncio.run(_serve_cli(args.host, args.port, args.approved_host, args.ready_file, args.evidence_file))
+    asyncio.run(_serve_cli(
+        args.host,
+        args.port,
+        args.approved_host,
+        args.ready_file,
+        args.evidence_file,
+        frozenset(args.compatibility_service_host),
+    ))
     return 0
 
 

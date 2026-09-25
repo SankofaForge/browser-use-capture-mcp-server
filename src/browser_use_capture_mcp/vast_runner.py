@@ -295,7 +295,8 @@ class VastRunner:
             f"useradd --system --no-create-home --shell /usr/sbin/nologin {REMOTE_CAPTURE_USER}; fi; "
             f"test \"$(id -u {REMOTE_CAPTURE_USER})\" -gt 0 && "
             f"install -d -m 0700 -o {REMOTE_CAPTURE_USER} -g {REMOTE_CAPTURE_USER} "
-            f"{_shell_quote(REMOTE_RUNS)} {_shell_quote(REMOTE_ROOT + '/state')}"
+            f"{_shell_quote(REMOTE_RUNS)} {_shell_quote(REMOTE_ROOT + '/state')} && "
+            f"install -d -m 0755 -o root -g root {_shell_quote(REMOTE_ROOT + '/component-cache')}"
         )
         provision_attestations = (
             f"install -d -m 0711 -o root -g root {_shell_quote('/workspace/browser-use-capture/attestations')} && "
@@ -350,29 +351,50 @@ class VastRunner:
         connection = await self.connection()
         await self.sync_project(connection)
         probe_directory = f"{REMOTE_RUNS}/{uuid.uuid4()}"
-        probe_temporary_directory = f"/tmp/bu-{uuid.uuid4().hex[:12]}"
         reviewed_egress_argument = " --reviewed-egress-experiment" if reviewed_egress_experiment else ""
-        command = (
-            f"install -d -m 0700 -o {REMOTE_CAPTURE_USER} -g {REMOTE_CAPTURE_USER} "
-            f"{_shell_quote(probe_directory)} {_shell_quote(probe_temporary_directory)} "
-            f"{_shell_quote(probe_temporary_directory + '/home')}; "
-            f"cd {_shell_quote(probe_directory)} && "
-            f"runuser -u {REMOTE_CAPTURE_USER} -- env "
-            f"HOME={_shell_quote(probe_temporary_directory + '/home')} "
-            f"TMPDIR={_shell_quote(probe_temporary_directory)} "
-            f"{self._browser_environment()} "
-            f"timeout --signal=TERM --kill-after=5s 120s {_shell_quote(REMOTE_VENV + '/bin/python')} "
-            f"{_shell_quote(REMOTE_APP + '/scripts/verify_compatibility.py')}"
-            f"{reviewed_egress_argument}; "
-            "code=$?; "
-            f"rm -rf -- {_shell_quote(probe_directory)} {_shell_quote(probe_temporary_directory)}; "
-            "exit \"$code\""
-        )
+        if reviewed_egress_experiment:
+            probe_temporary_directory = f"/tmp/bu-{uuid.uuid4().hex[:12]}"
+            command = (
+                f"install -d -m 0700 -o {REMOTE_CAPTURE_USER} -g {REMOTE_CAPTURE_USER} "
+                f"{_shell_quote(probe_directory)} {_shell_quote(probe_temporary_directory)} "
+                f"{_shell_quote(probe_temporary_directory + '/home')}; "
+                f"cd {_shell_quote(probe_directory)} && "
+                f"runuser -u {REMOTE_CAPTURE_USER} -- env "
+                f"HOME={_shell_quote(probe_temporary_directory + '/home')} "
+                f"TMPDIR={_shell_quote(probe_temporary_directory)} "
+                f"{self._browser_environment()} "
+                f"timeout --signal=TERM --kill-after=5s 120s {_shell_quote(REMOTE_VENV + '/bin/python')} "
+                f"{_shell_quote(REMOTE_APP + '/scripts/verify_compatibility.py')}"
+                f"{reviewed_egress_argument}; "
+                "code=$?; "
+                f"rm -rf -- {_shell_quote(probe_directory)} {_shell_quote(probe_temporary_directory)}; "
+                "exit \"$code\""
+            )
+        else:
+            command = (
+                f"install -d -m 0700 -o {REMOTE_CAPTURE_USER} -g {REMOTE_CAPTURE_USER} "
+                f"{_shell_quote(probe_directory)}; "
+                f"cd {_shell_quote(probe_directory)} && "
+                f"timeout --signal=TERM --kill-after=5s 220s {_shell_quote(REMOTE_PYTHON)} "
+                f"{_shell_quote(REMOTE_APP + '/remote/egress_boundary.py')} compatibility "
+                f"--run-id {_shell_quote(probe_directory.rsplit('/', 1)[-1])} "
+                f"--run-directory {_shell_quote(probe_directory)} "
+                f"--runner-id {_shell_quote(self.instance_id)} "
+                f"--browser {_shell_quote(self.browser_path)} "
+                "--browser-use-version 0.13.10 "
+                f"--capture-user {_shell_quote(REMOTE_CAPTURE_USER)} "
+                f"--python {_shell_quote(REMOTE_VENV + '/bin/python')} "
+                f"--script {_shell_quote(REMOTE_APP + '/scripts/verify_compatibility.py')} "
+                "--timeout 120; "
+                "code=$?; "
+                f"rm -rf -- {_shell_quote(probe_directory)}; "
+                "exit \"$code\""
+            )
         try:
             stdout, _ = await self._run_remote(
                 connection,
                 command,
-                timeout=135,
+                timeout=240 if not reviewed_egress_experiment else 135,
                 error_code="browser-use-compatibility-unverified",
             )
             payload = self._last_json_line(stdout)
@@ -386,15 +408,19 @@ class VastRunner:
         payload["vastInstanceId"] = self.instance_id
         cpu = payload.get("cpu", {})
         gpu = payload.get("gpu", {})
-        if payload.get("browserExecutable") != self.browser_path:
+        reported_browser = payload.get("browserExecutable")
+        if isinstance(reported_browser, str) and reported_browser != self.browser_path:
             payload["status"] = "blocked"
             payload["failureReason"] = "compatibility result did not match configured browser executable"
-        elif not payload.get("browserUseVersion") or not payload.get("browserVersion"):
-            payload["status"] = "blocked"
-            payload["failureReason"] = "compatibility result omitted a Browser Use or browser version"
         elif cpu.get("status") != "verified" or gpu.get("status") != "verified":
             payload["status"] = "blocked"
             payload["failureReason"] = payload.get("failureReason") or cpu.get("failureReason") or gpu.get("reason") or "CPU and GPU checks did not both pass"
+        elif reported_browser != self.browser_path:
+            payload["status"] = "blocked"
+            payload["failureReason"] = "compatibility result omitted the configured browser executable"
+        elif not payload.get("browserUseVersion") or not payload.get("browserVersion"):
+            payload["status"] = "blocked"
+            payload["failureReason"] = "compatibility result omitted a Browser Use or browser version"
         if reviewed_egress_experiment:
             payload["diagnosticOnly"] = True
             payload["captureAuthorized"] = False
