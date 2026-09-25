@@ -143,7 +143,7 @@ def test_remote_termination_waits_for_worker_cleanup(monkeypatch):
     assert options["timeout"] == 90
 
 
-def test_compatibility_probe_uses_short_run_scoped_temp_paths(monkeypatch):
+def test_compatibility_probe_uses_the_capture_egress_boundary(monkeypatch):
     monkeypatch.setenv("BROWSER_USE_CHROMIUM_PATH", "/opt/google/chrome/chrome")
     runner = VastRunner()
     payload = {
@@ -163,9 +163,12 @@ def test_compatibility_probe_uses_short_run_scoped_temp_paths(monkeypatch):
 
     async def fake_run_remote(connection, command, **kwargs):
         assert "--reviewed-egress-experiment" not in command
-        assert "HOME='/tmp/bu-" in command
-        assert "TMPDIR='/tmp/bu-" in command
-        assert "HOME='/workspace/browser-use-capture/runs/" not in command
+        assert "egress_boundary.py' compatibility" in command
+        assert "--capture-user" in command
+        assert "--script" in command
+        assert "--timeout 120" in command
+        assert "timeout --signal=TERM --kill-after=5s 220s" in command
+        assert kwargs["timeout"] == 240
         return json.dumps(payload).encode(), b""
 
     monkeypatch.setattr(runner, "connection", fake_connection)
@@ -175,6 +178,41 @@ def test_compatibility_probe_uses_short_run_scoped_temp_paths(monkeypatch):
     result = asyncio.run(runner.check_compatibility())
 
     assert result["status"] == "verified"
+
+
+def test_compatibility_boundary_failure_is_not_reported_as_browser_path_mismatch(monkeypatch):
+    monkeypatch.setenv("BROWSER_USE_CHROMIUM_PATH", "/opt/google/chrome/chrome")
+    runner = VastRunner()
+    failure = "required Linux capabilities unavailable: CAP_NET_ADMIN, CAP_SYS_ADMIN"
+    payload = {
+        "status": "blocked",
+        "failureReason": failure,
+        "cpu": {"status": "blocked", "failureReason": failure},
+        "gpu": {"status": "blocked", "reason": failure},
+        "egressPolicy": {
+            "status": "blocked",
+            "failureReason": "The namespace, exact-host proxy, or cleanup evidence failed.",
+            "browserServiceReachability": "blocked",
+        },
+    }
+
+    async def fake_connection():
+        return VastConnection("root", "8.8.8.8", 2222)
+
+    async def fake_sync_project(connection):
+        return None
+
+    async def fake_run_remote(connection, command, **kwargs):
+        return json.dumps(payload).encode(), b""
+
+    monkeypatch.setattr(runner, "connection", fake_connection)
+    monkeypatch.setattr(runner, "sync_project", fake_sync_project)
+    monkeypatch.setattr(runner, "_run_remote", fake_run_remote)
+
+    result = asyncio.run(runner.check_compatibility())
+
+    assert result["status"] == "blocked"
+    assert result["failureReason"] == failure
 
 
 def test_reviewed_egress_probe_is_explicit_and_never_authorizes_capture(monkeypatch):
