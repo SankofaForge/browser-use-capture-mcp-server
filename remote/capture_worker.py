@@ -258,12 +258,17 @@ def _validate_run_location(run_id: str, output_dir: Any, runs_root: Path = RUNS_
     if requested.exists() and requested.is_symlink():
         raise ValueError("output_dir must not be a symlink")
     expected = root / run_id
+    expected_artifacts = expected / "artifacts"
     resolved = requested.resolve(strict=False)
-    if str(requested) != str(expected) or resolved != expected:
-        raise ValueError("output_dir must be the run_id directory below the capture runs root")
-    if requested.name != run_id or requested.parent.resolve(strict=False) != root:
-        raise ValueError("output_dir must be the run_id directory below the capture runs root")
-    return expected
+    if requested == expected and resolved == expected:
+        return expected
+    if (
+        requested == expected_artifacts
+        and resolved == expected_artifacts
+        and requested.parent.resolve(strict=False) == expected
+    ):
+        return expected_artifacts
+    raise ValueError("output_dir must be the run_id directory or its artifacts child below the capture runs root")
 
 
 def _safe_basename(value: Any) -> str:
@@ -646,13 +651,27 @@ async def _http_json(url: str, timeout: float = 2) -> Any:
     return await asyncio.to_thread(read)
 
 
-async def wait_for_cdp(port: int, process: asyncio.subprocess.Process, timeout: float = 30) -> dict[str, Any]:
+async def wait_for_cdp(
+    port: int,
+    process: asyncio.subprocess.Process,
+    timeout: float = 30,
+    stderr_task: asyncio.Task[str] | None = None,
+) -> dict[str, Any]:
     deadline = asyncio.get_running_loop().time() + timeout
     endpoint = f"http://127.0.0.1:{port}/json/version"
     last_error = "CDP endpoint did not become ready"
     while asyncio.get_running_loop().time() < deadline:
         if process.returncode is not None:
-            raise WorkerFailure("browser-startup-failed", "Chrome exited before CDP became ready")
+            detail = ""
+            if stderr_task:
+                try:
+                    detail = (await asyncio.wait_for(asyncio.shield(stderr_task), timeout=2)).strip()
+                except Exception:
+                    pass
+            message = "Chrome exited before CDP became ready"
+            if detail:
+                message += f": {detail[-1200:]}"
+            raise WorkerFailure("browser-startup-failed", message)
         try:
             result = await _http_json(endpoint, timeout=1)
             websocket_url = result.get("webSocketDebuggerUrl")
@@ -1907,7 +1926,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
             browser_namespace_inode = os.stat(f"/proc/{browser.pid}/ns/net").st_ino
             if browser_namespace_inode != egress_attestation["networkNamespaceInode"]:
                 raise WorkerFailure("capture-egress-namespace-mismatch", "Chrome did not inherit the attested network namespace")
-            cdp_info = await wait_for_cdp(cdp_port, browser, timeout=30)
+            cdp_info = await wait_for_cdp(cdp_port, browser, timeout=30, stderr_task=browser_stderr_task)
             if not cdp_info.get("browserVersion"):
                 raise WorkerFailure("browser-startup-unverified", "Chrome CDP did not report a browser version")
             await asyncio.wait_for(session.start(), timeout=30)

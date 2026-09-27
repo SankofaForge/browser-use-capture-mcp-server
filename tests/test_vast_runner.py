@@ -25,6 +25,7 @@ def test_worker_payload_maps_legacy_fields_without_schema_leaks():
 
     assert payload["scroll"] is False
     assert payload["tail_ms"] == 800
+    assert payload["output_dir"] == "/workspace/browser-use-capture/runs/707df2a1-f11e-421c-b255-2b0181b13a27/artifacts"
     assert not {"gpu", "no_scroll", "tail_lines"}.intersection(payload)
 
 
@@ -46,6 +47,21 @@ def test_scp_transfer_rejects_unapproved_remote_directories():
     runner = VastRunner()
     with pytest.raises(VastRunnerError, match="destination is not approved"):
         runner._scp_args(VastConnection("root", "8.8.8.8", 2222), [], "../../tmp")
+
+
+def test_copy_remote_files_accepts_the_run_artifacts_directory(tmp_path):
+    runner = VastRunner()
+    runner._ssh_options = lambda: []
+    commands = []
+
+    async def run_local(command, **_kwargs):
+        commands.append(command)
+
+    runner._run_local = run_local
+    path = "/workspace/browser-use-capture/runs/707df2a1-f11e-421c-b255-2b0181b13a27/artifacts/desktop-full.webm"
+    asyncio.run(runner._copy_remote_files(VastConnection("root", "8.8.8.8", 2222), [path], tmp_path))
+
+    assert path in commands[0][commands[0].index("-P") + 2]
 
 
 def test_browser_use_runtime_disables_remote_telemetry_cloud_and_version_checks(monkeypatch):
