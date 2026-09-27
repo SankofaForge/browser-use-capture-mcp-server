@@ -419,6 +419,32 @@ def test_output_directory_must_be_exact_run_child(tmp_path: Path):
         worker.validate_request(payload, runs_root=runs_root)
 
 
+def test_output_directory_may_be_artifacts_child_of_exact_run(tmp_path: Path):
+    runs_root = tmp_path / "runs"
+    run_id = str(uuid.uuid4())
+    artifacts = runs_root / run_id / "artifacts"
+    payload = request_payload(runs_root, run_id=run_id, output_dir=str(artifacts))
+
+    request = worker.validate_request(payload, runs_root=runs_root)
+
+    assert request["output_dir"] == artifacts
+
+
+def test_wait_for_cdp_includes_captured_chrome_stderr():
+    class ExitedProcess:
+        returncode = 1
+
+    async def run():
+        async def stderr():
+            return "Chrome startup diagnostic"
+
+        task = asyncio.create_task(stderr())
+        with pytest.raises(worker.WorkerFailure, match="Chrome startup diagnostic"):
+            await worker.wait_for_cdp(1, ExitedProcess(), stderr_task=task)
+
+    asyncio.run(run())
+
+
 def test_output_directory_symlink_is_rejected(tmp_path: Path):
     runs_root = tmp_path / "runs"
     run_id = str(uuid.uuid4())

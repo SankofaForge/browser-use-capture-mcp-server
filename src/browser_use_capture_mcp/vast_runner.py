@@ -89,7 +89,7 @@ class VastRunner:
         }
         worker_input.update({
             "run_id": run_id,
-            "output_dir": run_directory,
+            "output_dir": f"{run_directory}/artifacts",
             "scroll": not capture.get("no_scroll", False),
             "tail_ms": capture.get("tail_lines", 800),
         })
@@ -440,7 +440,7 @@ class VastRunner:
 
     async def _copy_remote_files(self, connection: VastConnection, remote_paths: list[str], local_directory: Path) -> None:
         if not remote_paths or any(
-            not re.fullmatch(r"/workspace/browser-use-capture/runs/[0-9a-f-]{36}/[A-Za-z0-9._-]{1,120}", path)
+            not re.fullmatch(r"/workspace/browser-use-capture/runs/[0-9a-f-]{36}/(?:artifacts/)?[A-Za-z0-9._-]{1,120}", path)
             for path in remote_paths
         ):
             raise VastRunnerError("capture-artifact-transfer-failed", "The remote artifact list is invalid")
@@ -487,9 +487,10 @@ class VastRunner:
         remote_result = f"{run_directory}/result.json"
         remote_exit = f"{run_directory}/worker.exit"
         remote_pid = f"{run_directory}/worker.pid"
-        remote_video = f"{run_directory}/{capture['name']}.webm"
-        remote_jank = f"{run_directory}/{capture['name']}.jank.json"
-        remote_manifest = f"{run_directory}/manifest.json"
+        artifact_directory = f"{run_directory}/artifacts"
+        remote_video = f"{artifact_directory}/{capture['name']}.webm"
+        remote_jank = f"{artifact_directory}/{capture['name']}.jank.json"
+        remote_manifest = f"{artifact_directory}/manifest.json"
         worker_input = self.build_worker_input(capture, run_id, run_directory)
         input_json = json.dumps(worker_input, separators=(",", ":")).encode()
         worker_command = (
@@ -566,7 +567,7 @@ class VastRunner:
                 reported_name = artifact_names.get(key)
                 if reported_name != expected_name:
                     continue
-                remote_path = f"{run_directory}/{expected_name}"
+                remote_path = f"{artifact_directory}/{expected_name}"
                 exists, _ = await self._run_remote(
                     connection,
                     f"if test -f {_shell_quote(remote_path)} && test ! -L {_shell_quote(remote_path)}; then printf present; else printf absent; fi",

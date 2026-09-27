@@ -29,8 +29,8 @@ MAX_AGE_SECONDS = 120
 ATTESTATION_ROOT = Path("/workspace/browser-use-capture/attestations")
 
 
-def run(args: list[str], *, timeout: float = 20, check: bool = True) -> subprocess.CompletedProcess:
-    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+def run(args: list[str], *, timeout: float = 20, check: bool = True, input_data: str | None = None) -> subprocess.CompletedProcess:
+    result = subprocess.run(args, input=input_data, capture_output=True, text=True, timeout=timeout, check=False)
     if check and result.returncode:
         raise RuntimeError(f"boundary command failed: {args[0]} ({result.returncode})")
     return result
@@ -636,7 +636,7 @@ def run_capture(args: argparse.Namespace) -> int:
             *(f"{key}={value}" for key, value in env.items()),
             args.python, args.worker,
         ]
-        capture = run(command, timeout=args.timeout + 240, check=False)
+        capture = run(command, timeout=args.timeout + 240, check=False, input_data=json.dumps(input_data))
         try:
             result_data = json.loads(capture.stdout.strip().splitlines()[-1])
         except (json.JSONDecodeError, IndexError):
@@ -658,7 +658,7 @@ def run_capture(args: argparse.Namespace) -> int:
                 "jank": f"{artifact_name}.jank.json",
                 "manifest": "manifest.json",
             }.items():
-                artifact_path = Path(args.run_directory) / filename
+                artifact_path = Path(args.run_directory) / "artifacts" / filename
                 if artifact_path.is_file() and not artifact_path.is_symlink():
                     artifacts.setdefault(key, filename)
         checked = _now()
