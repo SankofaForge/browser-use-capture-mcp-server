@@ -262,8 +262,6 @@ class VastRunner:
             self.package_root / "uv.lock",
             self.package_root / "scripts" / "verify_compatibility.py",
             self.package_root / "remote" / "capture_worker.py",
-            self.package_root / "remote" / "public_socks_proxy.py",
-            self.package_root / "remote" / "egress_boundary.py",
         ]
         missing = [path.name for path in required if not path.is_file()]
         if missing:
@@ -278,11 +276,7 @@ class VastRunner:
         transfer_groups = (
             ([self.package_root / "pyproject.toml", self.package_root / "uv.lock"], ""),
             ([self.package_root / "scripts" / "verify_compatibility.py"], "scripts"),
-            ([
-                self.package_root / "remote" / "capture_worker.py",
-                self.package_root / "remote" / "public_socks_proxy.py",
-                self.package_root / "remote" / "egress_boundary.py",
-            ], "remote"),
+            ([self.package_root / "remote" / "capture_worker.py"], "remote"),
         )
         for sources, remote_directory in transfer_groups:
             await self._run_local(
@@ -298,21 +292,11 @@ class VastRunner:
             f"{_shell_quote(REMOTE_RUNS)} {_shell_quote(REMOTE_ROOT + '/state')} && "
             f"install -d -m 0755 -o root -g root {_shell_quote(REMOTE_ROOT + '/component-cache')}"
         )
-        provision_attestations = (
-            f"install -d -m 0711 -o root -g root {_shell_quote('/workspace/browser-use-capture/attestations')} && "
-            f"test \"$(stat -c '%u:%a' {_shell_quote('/workspace/browser-use-capture/attestations')})\" = '0:711'"
-        )
         await self._run_remote(
             connection,
             provision_capture_user,
             timeout=30,
             error_code="capture-user-provision-failed",
-        )
-        await self._run_remote(
-            connection,
-            provision_attestations,
-            timeout=30,
-            error_code="capture-attestation-provision-failed",
         )
         provision_runtime = (
             f"install -d -m 0755 -o root -g root {_shell_quote(REMOTE_RUNTIME)} "
@@ -345,88 +329,47 @@ class VastRunner:
                 return payload
         raise VastRunnerError("remote-result-invalid", "The remote runner did not return a JSON result", _safe_output(output))
 
-    async def check_compatibility(self, *, reviewed_egress_experiment: bool = False) -> dict[str, Any]:
-        if not isinstance(reviewed_egress_experiment, bool):
-            raise VastRunnerError("compatibility-option-invalid", "The reviewed egress option must be boolean")
+    async def check_compatibility(self) -> dict[str, Any]:
         connection = await self.connection()
         await self.sync_project(connection)
         probe_directory = f"{REMOTE_RUNS}/{uuid.uuid4()}"
-        reviewed_egress_argument = " --reviewed-egress-experiment" if reviewed_egress_experiment else ""
-        if reviewed_egress_experiment:
-            probe_temporary_directory = f"/tmp/bu-{uuid.uuid4().hex[:12]}"
-            command = (
-                f"install -d -m 0700 -o {REMOTE_CAPTURE_USER} -g {REMOTE_CAPTURE_USER} "
-                f"{_shell_quote(probe_directory)} {_shell_quote(probe_temporary_directory)} "
-                f"{_shell_quote(probe_temporary_directory + '/home')}; "
-                f"cd {_shell_quote(probe_directory)} && "
-                f"runuser -u {REMOTE_CAPTURE_USER} -- env "
-                f"HOME={_shell_quote(probe_temporary_directory + '/home')} "
-                f"TMPDIR={_shell_quote(probe_temporary_directory)} "
-                f"{self._browser_environment()} "
-                f"timeout --signal=TERM --kill-after=5s 120s {_shell_quote(REMOTE_VENV + '/bin/python')} "
-                f"{_shell_quote(REMOTE_APP + '/scripts/verify_compatibility.py')}"
-                f"{reviewed_egress_argument}; "
-                "code=$?; "
-                f"rm -rf -- {_shell_quote(probe_directory)} {_shell_quote(probe_temporary_directory)}; "
-                "exit \"$code\""
-            )
-        else:
-            command = (
-                f"install -d -m 0700 -o {REMOTE_CAPTURE_USER} -g {REMOTE_CAPTURE_USER} "
-                f"{_shell_quote(probe_directory)}; "
-                f"cd {_shell_quote(probe_directory)} && "
-                f"timeout --signal=TERM --kill-after=5s 220s {_shell_quote(REMOTE_PYTHON)} "
-                f"{_shell_quote(REMOTE_APP + '/remote/egress_boundary.py')} compatibility "
-                f"--run-id {_shell_quote(probe_directory.rsplit('/', 1)[-1])} "
-                f"--run-directory {_shell_quote(probe_directory)} "
-                f"--runner-id {_shell_quote(self.instance_id)} "
-                f"--browser {_shell_quote(self.browser_path)} "
-                "--browser-use-version 0.13.10 "
-                f"--capture-user {_shell_quote(REMOTE_CAPTURE_USER)} "
-                f"--python {_shell_quote(REMOTE_VENV + '/bin/python')} "
-                f"--script {_shell_quote(REMOTE_APP + '/scripts/verify_compatibility.py')} "
-                "--timeout 120; "
-                "code=$?; "
-                f"rm -rf -- {_shell_quote(probe_directory)}; "
-                "exit \"$code\""
-            )
+        command = (
+            f"install -d -m 0700 -o {REMOTE_CAPTURE_USER} -g {REMOTE_CAPTURE_USER} "
+            f"{_shell_quote(probe_directory)} {_shell_quote(probe_directory + '/home')} "
+            f"{_shell_quote(probe_directory + '/tmp')}; "
+            f"cd {_shell_quote(probe_directory)} && "
+            f"runuser -u {REMOTE_CAPTURE_USER} -- env "
+            f"HOME={_shell_quote(probe_directory + '/home')} "
+            f"TMPDIR={_shell_quote(probe_directory + '/tmp')} "
+            f"{self._browser_environment()} "
+            f"timeout --signal=TERM --kill-after=5s 120s {_shell_quote(REMOTE_VENV + '/bin/python')} "
+            f"{_shell_quote(REMOTE_APP + '/scripts/verify_compatibility.py')}; "
+            "code=$?; "
+            f"rm -rf -- {_shell_quote(probe_directory)}; "
+            "exit \"$code\""
+        )
         try:
             stdout, _ = await self._run_remote(
-                connection,
-                command,
-                timeout=240 if not reviewed_egress_experiment else 135,
+                connection, command, timeout=140,
                 error_code="browser-use-compatibility-unverified",
             )
             payload = self._last_json_line(stdout)
         except VastRunnerError as error:
             if error.reason_code != "browser-use-compatibility-unverified":
                 raise
-            try:
-                payload = self._last_json_line(error.diagnostic.encode("utf-8") if error.diagnostic else b"")
-            except VastRunnerError:
-                raise
+            payload = self._last_json_line(error.diagnostic.encode("utf-8") if error.diagnostic else b"")
         payload["vastInstanceId"] = self.instance_id
         cpu = payload.get("cpu", {})
         gpu = payload.get("gpu", {})
-        reported_browser = payload.get("browserExecutable")
-        if isinstance(reported_browser, str) and reported_browser != self.browser_path:
+        if payload.get("browserExecutable") != self.browser_path:
             payload["status"] = "blocked"
             payload["failureReason"] = "compatibility result did not match configured browser executable"
         elif cpu.get("status") != "verified" or gpu.get("status") != "verified":
             payload["status"] = "blocked"
-            payload["failureReason"] = payload.get("failureReason") or cpu.get("failureReason") or gpu.get("reason") or "CPU and GPU checks did not both pass"
-        elif reported_browser != self.browser_path:
-            payload["status"] = "blocked"
-            payload["failureReason"] = "compatibility result omitted the configured browser executable"
+            payload["failureReason"] = payload.get("failureReason") or "CPU and GPU checks did not both pass"
         elif not payload.get("browserUseVersion") or not payload.get("browserVersion"):
             payload["status"] = "blocked"
             payload["failureReason"] = "compatibility result omitted a Browser Use or browser version"
-        if reviewed_egress_experiment:
-            payload["diagnosticOnly"] = True
-            payload["captureAuthorized"] = False
-            if payload.get("status") == "verified":
-                payload["status"] = "blocked"
-                payload["failureReason"] = "temporary egress experiment cannot authorize capture"
         return payload
 
     async def _copy_remote_file(self, connection: VastConnection, remote_path: str, local_path: Path) -> None:
@@ -496,19 +439,15 @@ class VastRunner:
         worker_command = (
             f"cd {_shell_quote(run_directory)}; "
             "set +e; "
-            f"{_shell_quote(REMOTE_PYTHON)} {_shell_quote(REMOTE_APP + '/remote/egress_boundary.py')} capture "
-            f"--run-id {_shell_quote(run_id)} "
-            f"--run-directory {_shell_quote(run_directory)} "
-            f"--input {_shell_quote(remote_input)} "
-            f"--result {_shell_quote(remote_result)} "
-            f"--runner-id {_shell_quote(self.instance_id)} "
-            f"--browser {_shell_quote(self.browser_path)} "
-            "--browser-use-version 0.13.10 "
-            f"--capture-user {_shell_quote(REMOTE_CAPTURE_USER)} "
-            f"--python {_shell_quote(REMOTE_VENV + '/bin/python')} "
-            f"--worker {_shell_quote(REMOTE_APP + '/remote/capture_worker.py')} "
-            f"--timeout {capture['timeout_ms'] // 1000} "
-            f"> {_shell_quote(run_directory + '/boundary.log')} 2>&1; "
+            f"runuser -u {REMOTE_CAPTURE_USER} -- env "
+            f"HOME={_shell_quote(run_directory + '/home')} "
+            f"TMPDIR={_shell_quote(run_directory + '/tmp')} "
+            f"{self._browser_environment()} "
+            f"timeout --signal=TERM --kill-after=5s {capture['timeout_ms'] // 1000}s "
+            f"{_shell_quote(REMOTE_VENV + '/bin/python')} "
+            f"{_shell_quote(REMOTE_APP + '/remote/capture_worker.py')} "
+            f"< {_shell_quote(remote_input)} > {_shell_quote(remote_result)} "
+            f"2> {_shell_quote(run_directory + '/worker.log')}; "
             "code=$?; "
             f"printf '%s\\n' \"$code\" > {_shell_quote(remote_exit)}; "
             "exit \"$code\""

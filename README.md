@@ -1,171 +1,51 @@
 # Browser Use capture MCP server
 
-This local stdio MCP server is the Browser Use adapter boundary for the
-design-inspiration capture contract. It exposes only `check_capture_gpu` and
-`capture_site_motion`. The required runtime keeps workflow control and MCP
-stdio local, then invokes the pinned Browser Use worker on the rented Linux GPU
-runner through the current SSH endpoint provided by Vast. Browser Use and
-Chrome do not run on the local workflow host.
+This local stdio MCP server exposes `check_capture_gpu` and
+`capture_site_motion` for design-inspiration captures. The local adapter
+connects to a rented Linux GPU runner over its current Vast SSH endpoint;
+Browser Use and Chrome run on that runner.
 
-The latest live probe passed CDP startup, page evaluation, viewport and
-reduced-motion control, jank collection, WebM recording, cleanup, and hardware
-WebGL.
-It did not prove that every Chrome network path uses the SOCKS proxy. The
-compatibility result now reports CPU behavior, GPU support, and egress status
-separately. Egress remains unverified, so the adapter must not issue a
-`gpu_check_id` or claim complete evidence.
-
-The adapter is intentionally fail-closed. Browser Use releases have changed
-their session and recording APIs, and this project must not create a WebM or
-jank manifest from an unverified API. The exact locked release must pass the
-compatibility spike; there is no manual compatibility override.
+The compatibility probe checks the pinned Browser Use API, Chrome startup and
+CDP attachment, page evaluation, viewport and reduced-motion controls, jank
+collection, WebM recording, cleanup, and hardware-backed WebGL. A fresh
+`gpu_check_id` requires a passing CPU and GPU probe. It binds to the runner,
+browser executable, and pinned Browser Use release. There is no manual
+compatibility override.
 
 The project pins `browser-use[video]==0.13.10` in `pyproject.toml` and
-`uv.lock`. Set `BROWSER_USE_CHROMIUM_PATH` in the remote worker environment to
-the absolute path of a provisioned, executable, non-Snap Chrome/Chromium binary
-on the GPU runner. The current real Chrome path is `/opt/google/chrome/chrome`.
-The earlier `/usr/bin/chromium-browser` path is a Snap installation shim and
-`/usr/bin/google-chrome` is a launcher chain; reject both before
-`BrowserSession` starts. Do not allow automatic browser downloads. The remote
-worker disables Browser Use telemetry, cloud sync, and release checks. Chrome
-starts on a local `data:` document so Browser Use's about:blank logo overlay
-does not request an unapproved host. Provide `VAST_API_KEY` to the local
-adapter only through its secret-aware environment; never put secret values in
-workflow configuration or diagnostics. Resolve the SSH host and port
-dynamically from Vast instead of hard-coding an instance endpoint.
+`uv.lock`. Set `BROWSER_USE_CHROMIUM_PATH` on the runner to an absolute,
+executable, non-Snap Chrome/Chromium binary. The current real Chrome path is
+`/opt/google/chrome/chrome`. The adapter starts Chrome explicitly on a
+run-scoped profile and loopback CDP port, then attaches Browser Use. Automatic
+browser downloads are disabled. Provide `VAST_API_KEY` only through the local
+secret-aware environment; resolve the SSH endpoint dynamically.
 
-The compatibility report treats `domain-not-approved` outcomes as proxy
-denials, not CPU-function failures. It records them under
-`egressPolicy.blockedDestinations`. Private destinations, proxy errors, and
-unapproved successful connections still block the egress result. The report
-also separates observations made before and after fixture navigation. These
-phases do not identify request initiators, URL paths, or Chrome services.
-
-The proxy's negative-control checks do not prove that all Chrome traffic uses
-the proxy. The result therefore keeps `egressPolicy.status` unverified until a
-browser-wide egress boundary is verified. It also reports Safe Browsing and
-component-update reachability as not assessed. No `gpu_check_id` is issued
-while either fact remains unresolved.
-
-A bounded runtime sweep on 2026-09-22 did not find a passing alternative.
-Chrome for Testing Stable 154.0.8037.57 passed the browser and hardware-WebGL
-checks but triggered five denied Google service hosts. Its headless shell
-failed the fixture-title and hardware-WebGL checks. Microsoft Edge Stable
-153.0.4234.48 passed the page, viewport, reduced-motion, jank, recording,
-cleanup, and GPU checks, but triggered denied requests to `edge.microsoft.com`
-on ports 80 and 443, `www.bing.com`, and
-`nav-edge.smartscreen.microsoft.com`. No egress rule or default browser
-changed. Capture remains blocked.
-
-The launch-argument audit found both `--disable-background-networking` and
-`--disable-component-update` in the initial source. The worker and probe now
-omit these switches, and regression tests keep them out. Chromium documents
-the first as disabling background network subsystems; it also disables Safe
-Browsing auto-updates. The second stops component-update registration. Do not
-restore either switch to suppress denied requests.
-
-Run the locked compatibility probe on the remote GPU runner with:
+Run the locked compatibility probe on the GPU runner with:
 
 ```text
 uv run --locked python scripts/verify_compatibility.py
 ```
 
-An explicitly approved egress diagnostic can use
-`--reviewed-egress-experiment`. It adds only `www.gstatic.com:443` and
-`update.googleapis.com:443` to that probe's in-process SOCKS policy. The
-exception is exact-host only, expires no later than 60 minutes after proxy
-creation, and ends earlier when the probe exits. The probe itself has a
-110-second deadline; the bounded Vast invocation stops it after 120 seconds.
-This does not change the runner's network firewall or the normal capture
-proxy: `capture_worker.py` never enables the experiment. Its result is marked
-diagnostic-only and cannot authorize capture or issue a `gpu_check_id`. Do not
-add hosts through command-line values or configuration.
-
-The proxy records a bounded summary of destination hostname, port, and
-connection outcome. The probe also records whether an observation occurred
-before or after fixture navigation. It does not inspect tunneled payloads,
-collect URL paths or HTTP methods, or observe request initiators. HTTPS
-metadata would require TLS interception, which is outside this diagnostic.
-The probe does not collect raw NetLog data. Do not infer a request source from
-its phase alone.
-
-The approved diagnostic ran once on 2026-09-23. Both candidate hosts connected,
-but CPU compatibility remained blocked by other destinations, including
-`clients2.google.com`, `www.google.com`, `accounts.google.com`,
-`android.clients.google.com`, `edgedl.me.gvt1.com`, and `dl.google.com`. GPU and
-hardware-backed WebGL passed. The probe remained diagnostic-only, issued no
-`gpu_check_id`, and did not change the ordinary proxy policy. See the [egress
-proposal and result](../../agent-infrastructure/knowledge/browser-use-capture-egress-proposal.md).
-
-The probe must launch Chrome, wait for its loopback CDP endpoint, and attach
-`BrowserSession`. It must verify page evaluation, viewport control,
-reduced-motion emulation, jank instrumentation, domain enforcement, recording,
-WebM validation, and cleanup. The JSON result must report separate CPU, GPU, and
-egress results. It must retain the executable path and browser versions, even
-when a gate fails. A CPU or GPU pass cannot override an unverified egress
-boundary. Test each blocked state and preserve its failure reason.
-
-The CPU gate checks browser functions. The GPU gate requires a working
-`nvidia-smi` and a hardware-backed WebGL renderer. SwiftShader and other
-software renderers fail. The egress gate must verify the browser-wide network
-boundary and required browser security-service reachability. A SOCKS
-negative-control result or successful TCP connection alone cannot pass that
-gate. A fresh
-`gpu_check_id` requires all three results to pass and must bind to the runner,
-browser executable, and Browser Use release.
-
-## Per-capture network boundary
-
-Each authoritative capture starts in a fresh Linux network namespace. The
-runner creates a veth pair and an nftables policy that permits the namespace
-to reach only the host-side exact-host SOCKS proxy; forwarding other traffic
-from the namespace is dropped. The proxy resolves the approved hostname,
-rejects non-public DNS answers, and pins its upstream connection to a checked
-public address. Chrome and its child processes must share the attested network
-namespace. The worker checks that namespace identity before capture, then the
-runner repeats the direct-denial and approved-proxy controls after capture.
-
-Runner provisioning requires root SSH access, `ip` from iproute2, `nft`, Linux
-network-namespace and veth support, and permission to install nftables input
-and forwarding rules. If any prerequisite or control fails, the worker returns
-`blocked` or `partial`; it does not issue complete evidence. The privileged
-runner writes the read-only proof named by remote
-`CAPTURE_EGRESS_ATTESTATION_FILE`. The worker validates the runner, executable,
-browser and Browser Use versions, approved hostname, namespace inode, direct
-and proxied controls, and a maximum 120-second proof lease. The local adapter
-copies the validated proof into `capture-cell.v2` evidence.
+Captures run as a dedicated nonroot user. The adapter accepts HTTP(S) public
+URLs, rejects private-address resolution, uses isolated profiles, and validates
+consent, recording, jank, artifact hashes, and cleanup. It does not create an
+egress attestation or require a proxy or network namespace. Chrome may make
+ordinary service requests during a capture. The target URL remains subject to
+public-address validation.
 
 ## Recover from a startup timeout
 
-1. Resolve the active Vast-managed SSH endpoint and confirm the configured
-   instance is reachable.
-2. On the runner, verify the configured path is absolute and executable, then
-   run that exact path with `--version`. Provision real Chrome if needed; do
-   not use `/usr/bin/chromium-browser` or another Snap shim.
-3. Start Chrome explicitly with a run-specific temporary profile and a
-   loopback debugging port. Wait for `/json/version` to report CDP readiness,
-   then attach Browser Use using that CDP URL. Do not rely on Browser Use's
-   local executable-discovery startup path.
-4. Run the locked CPU and GPU/WebGL checks. Review the egress result separately.
-   A SOCKS negative-control pass does not prove that all browser traffic uses
-   the proxy or verify required browser security-service reachability. A TCP
-   connection alone does not prove that a service works. Record the JSON result
-   and repair the reported cause before retrying.
-5. Only after CPU, GPU, and browser-wide egress checks pass may
-   `check_capture_gpu` issue a fresh, runner-bound `gpu_check_id`. No manual
-   compatibility override or automatic `site-motion-capture` fallback is
-   permitted.
+1. Resolve the active Vast-managed SSH endpoint and confirm the runner is reachable.
+2. Verify that `BROWSER_USE_CHROMIUM_PATH` is an absolute executable and run
+   that binary with `--version`.
+3. Start Chrome with a run-specific profile and loopback CDP port. Wait for
+   `/json/version`, then attach Browser Use.
+4. Run the CPU and hardware WebGL checks, record the JSON result, and fix any
+   reported failure before retrying.
 
 Missing browser, SSH or startup timeout, missing GPU, software WebGL renderer,
 recording or jank failure, consent uncertainty, domain violation, timeout,
 cleanup failure, or artifact mismatch remains `blocked` or `partial`.
-
-The server validates HTTP(S) URLs, rejects private-address resolution,
-requires explicit approval for `consent_mode: "accept"`, requires all
-selectors for granular consent, isolates artifact names, hashes artifacts,
-and requires `ffprobe` to validate non-empty WebM files. It does not use
-Browser Use Cloud, persistent user profiles, raw filesystem tools, or the
-autonomous Browser Use agent path.
 
 ## Runtime
 

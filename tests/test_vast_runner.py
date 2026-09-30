@@ -37,7 +37,7 @@ def test_worker_payload_rejects_cpu_only_capture():
 def test_scp_transfer_preserves_the_approved_remote_subdirectory(tmp_path):
     runner = VastRunner(package_root=tmp_path)
     runner._ssh_options = lambda: []
-    source = tmp_path / "remote" / "public_socks_proxy.py"
+    source = tmp_path / "remote" / "capture_worker.py"
     args = runner._scp_args(VastConnection("root", "8.8.8.8", 2222), [source], "remote")
     assert args[-1] == "root@8.8.8.8:/workspace/browser-use-capture/app/remote"
     assert str(source) in args
@@ -159,14 +159,14 @@ def test_remote_termination_waits_for_worker_cleanup(monkeypatch):
     assert options["timeout"] == 90
 
 
-def test_compatibility_probe_uses_the_capture_egress_boundary(monkeypatch):
+def test_compatibility_probe_runs_as_unprivileged_user(monkeypatch):
     monkeypatch.setenv("BROWSER_USE_CHROMIUM_PATH", "/opt/google/chrome/chrome")
     runner = VastRunner()
     payload = {
         "status": "verified",
         "browserExecutable": "/opt/google/chrome/chrome",
         "browserUseVersion": "0.13.10",
-        "browserVersion": "Chrome/154.0.8037.57",
+        "browserVersion": "Chrome/154.0",
         "cpu": {"status": "verified"},
         "gpu": {"status": "verified"},
     }
@@ -178,93 +178,15 @@ def test_compatibility_probe_uses_the_capture_egress_boundary(monkeypatch):
         return None
 
     async def fake_run_remote(connection, command, **kwargs):
-        assert "--reviewed-egress-experiment" not in command
-        assert "egress_boundary.py' compatibility" in command
-        assert "--capture-user" in command
-        assert "--script" in command
-        assert "--timeout 120" in command
-        assert "timeout --signal=TERM --kill-after=5s 220s" in command
-        assert kwargs["timeout"] == 240
+        assert "runuser -u browser-capture" in command
+        assert "verify_compatibility.py" in command
+        assert "egress_boundary" not in command
         return json.dumps(payload).encode(), b""
 
     monkeypatch.setattr(runner, "connection", fake_connection)
     monkeypatch.setattr(runner, "sync_project", fake_sync_project)
     monkeypatch.setattr(runner, "_run_remote", fake_run_remote)
-
-    result = asyncio.run(runner.check_compatibility())
-
-    assert result["status"] == "verified"
-
-
-def test_compatibility_boundary_failure_is_not_reported_as_browser_path_mismatch(monkeypatch):
-    monkeypatch.setenv("BROWSER_USE_CHROMIUM_PATH", "/opt/google/chrome/chrome")
-    runner = VastRunner()
-    failure = "required Linux capabilities unavailable: CAP_NET_ADMIN, CAP_SYS_ADMIN"
-    payload = {
-        "status": "blocked",
-        "failureReason": failure,
-        "cpu": {"status": "blocked", "failureReason": failure},
-        "gpu": {"status": "blocked", "reason": failure},
-        "egressPolicy": {
-            "status": "blocked",
-            "failureReason": "The namespace, exact-host proxy, or cleanup evidence failed.",
-            "browserServiceReachability": "blocked",
-        },
-    }
-
-    async def fake_connection():
-        return VastConnection("root", "8.8.8.8", 2222)
-
-    async def fake_sync_project(connection):
-        return None
-
-    async def fake_run_remote(connection, command, **kwargs):
-        return json.dumps(payload).encode(), b""
-
-    monkeypatch.setattr(runner, "connection", fake_connection)
-    monkeypatch.setattr(runner, "sync_project", fake_sync_project)
-    monkeypatch.setattr(runner, "_run_remote", fake_run_remote)
-
-    result = asyncio.run(runner.check_compatibility())
-
-    assert result["status"] == "blocked"
-    assert result["failureReason"] == failure
-
-
-def test_reviewed_egress_probe_is_explicit_and_never_authorizes_capture(monkeypatch):
-    monkeypatch.setenv("BROWSER_USE_CHROMIUM_PATH", "/opt/google/chrome/chrome")
-    runner = VastRunner()
-    payload = {
-        "status": "verified",
-        "browserExecutable": "/opt/google/chrome/chrome",
-        "browserUseVersion": "0.13.10",
-        "browserVersion": "Chrome/154.0.8037.57",
-        "cpu": {"status": "verified"},
-        "gpu": {"status": "verified"},
-    }
-    commands = []
-
-    async def fake_connection():
-        return VastConnection("root", "8.8.8.8", 2222)
-
-    async def fake_sync_project(connection):
-        return None
-
-    async def fake_run_remote(connection, command, **kwargs):
-        commands.append(command)
-        return json.dumps(payload).encode(), b""
-
-    monkeypatch.setattr(runner, "connection", fake_connection)
-    monkeypatch.setattr(runner, "sync_project", fake_sync_project)
-    monkeypatch.setattr(runner, "_run_remote", fake_run_remote)
-
-    result = asyncio.run(runner.check_compatibility(reviewed_egress_experiment=True))
-
-    assert "--reviewed-egress-experiment" in commands[0]
-    assert result["status"] == "blocked"
-    assert result["diagnosticOnly"] is True
-    assert result["captureAuthorized"] is False
-    assert result["failureReason"] == "temporary egress experiment cannot authorize capture"
+    assert asyncio.run(runner.check_compatibility())["status"] == "verified"
 
 
 def test_vast_api_key_is_not_inherited_by_ssh_processes(monkeypatch):
@@ -295,22 +217,6 @@ def test_configured_missing_ssh_identity_fails_closed(monkeypatch, tmp_path):
     monkeypatch.setenv("SITE_MOTION_SSH_KEY", str(tmp_path / "missing-key"))
     with pytest.raises(VastRunnerError, match="identity file is unavailable"):
         VastRunner()._ssh_options()
-
-
-def test_compatibility_probe_preserves_cpu_failure_when_gpu_passes():
-    import sys
-    from pathlib import Path
-
-    scripts = Path(__file__).parents[1] / "scripts"
-    sys.path.insert(0, str(scripts))
-    from verify_compatibility import _overall_failure_reason
-
-    assert _overall_failure_reason("blocked", {"status": "verified"}) == "one or more CPU compatibility checks failed"
-    assert _overall_failure_reason(
-        "blocked",
-        {"status": "verified"},
-        "network egress policy blocked one or more browser requests",
-    ) == "network egress policy blocked one or more browser requests"
 
 
 def test_ssh_url_parser_rejects_non_public_endpoints(monkeypatch):

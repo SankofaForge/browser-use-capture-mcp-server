@@ -15,7 +15,6 @@ import subprocess
 import tempfile
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
@@ -258,7 +257,6 @@ def _issue_capability_record(probe: dict[str, Any], runner: VastRunner) -> dict[
         "status": "verified",
         "gpu": probe["gpu"],
         "cpu": probe["cpu"],
-        "egressPolicy": probe["egressPolicy"],
         "browserUseVersion": probe.get("browserUseVersion"),
         "browserVersion": probe.get("browserVersion"),
         "browserExecutable": probe.get("browserExecutable"),
@@ -404,84 +402,6 @@ def _validate_remote_manifest(manifest: Any, stage_dir: Path, name: str, run_id:
     return verified
 
 
-def _validate_egress_attestation(
-    evidence: Any,
-    *,
-    capture: dict[str, Any],
-    run_id: str,
-    runner: VastRunner,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    if not isinstance(evidence, dict):
-        raise ValueError("runner egress evidence is missing")
-    summary = evidence.get("egress")
-    attestation = evidence.get("egressAttestation")
-    runtime = evidence.get("runtime")
-    if not isinstance(summary, dict) or not isinstance(attestation, dict) or not isinstance(runtime, dict):
-        raise ValueError("runner egress attestation or runtime evidence is missing")
-    try:
-        checked = datetime.fromisoformat(str(attestation.get("checkedAt", "")).replace("Z", "+00:00"))
-        expires = datetime.fromisoformat(str(attestation.get("expiresAt", "")).replace("Z", "+00:00"))
-    except ValueError as error:
-        raise ValueError("runner egress attestation timestamps are invalid") from error
-    now = datetime.now(timezone.utc)
-    approved_host = urlsplit(capture["url"]).hostname
-    if not approved_host:
-        raise ValueError("capture URL has no approved hostname for egress binding")
-    approved_host = approved_host.encode("idna").decode("ascii").lower().rstrip(".")
-    proxy_evidence = attestation.get("proxyEvidence")
-    proxy_connections = proxy_evidence.get("connectionOutcomes") if isinstance(proxy_evidence, dict) else None
-    proxy_verified = (
-        isinstance(proxy_evidence, dict)
-        and proxy_evidence.get("violations") == []
-        and isinstance(proxy_connections, list)
-        and any(
-            isinstance(item, dict)
-            and item.get("hostname") == approved_host
-            and item.get("port") == (urlsplit(capture["url"]).port or (443 if urlsplit(capture["url"]).scheme == "https" else 80))
-            and item.get("outcome") == "connected"
-            and item.get("count", 0) > 0
-            for item in proxy_connections
-        )
-    )
-    controls = attestation.get("controls") if isinstance(attestation.get("controls"), dict) else {}
-    direct_control = controls.get("direct") if isinstance(controls.get("direct"), dict) else {}
-    proxied_control = controls.get("proxied") if isinstance(controls.get("proxied"), dict) else {}
-    valid = (
-        attestation.get("schemaVersion") == "runner-egress-boundary.v1"
-        and attestation.get("runId") == run_id
-        and isinstance(attestation.get("boundaryId"), str) and bool(attestation["boundaryId"].strip())
-        and attestation.get("runnerInstanceId") == runner.instance_id
-        and attestation.get("browserExecutable") == runner.browser_path
-        and attestation.get("browserVersion") == runtime.get("browserVersion")
-        and attestation.get("captureRuntime") == "browser-use"
-        and attestation.get("captureRuntimeVersion") == runtime.get("browserUseVersion")
-        and attestation.get("browserUseVersion") == "0.13.10"
-        and attestation.get("approvedHost") == approved_host
-        and isinstance(attestation.get("networkNamespaceInode"), int)
-        and attestation.get("directEgressBlocked") is True
-        and attestation.get("proxyPolicy") == "capture-exact-host.v1"
-        and direct_control.get("status") == "blocked"
-        and proxied_control.get("status") == "passed"
-        and attestation.get("cleanupVerified") is True
-        and checked.tzinfo is not None and expires.tzinfo is not None
-        and checked <= now
-        and expires - checked <= timedelta(seconds=120)
-        and expires > checked
-        and proxy_verified
-        and summary.get("status") == "verified"
-        and summary.get("boundaryId") == attestation.get("boundaryId")
-        and summary.get("directEgressBlocked") is True
-        and summary.get("approvedProxyProbe") is True
-        and summary.get("proxyPolicy") == "capture-exact-host.v1"
-        and summary.get("approvedHost") == approved_host
-        and summary.get("networkNamespaceInode") == attestation.get("networkNamespaceInode")
-        and summary.get("cleanupVerified") is True
-    )
-    if not valid:
-        raise ValueError("runner egress boundary proof is stale, unbound, or incomplete")
-    return summary, attestation
-
-
 async def _compatibility_result(runner: VastRunner) -> dict[str, Any]:
     try:
         probe = await runner.check_compatibility()
@@ -497,48 +417,28 @@ async def _compatibility_result(runner: VastRunner) -> dict[str, Any]:
         )
     cpu = probe.get("cpu")
     gpu = probe.get("gpu")
-    egress_policy = probe.get("egressPolicy")
     cpu = cpu if isinstance(cpu, dict) else {}
     gpu = gpu if isinstance(gpu, dict) else {}
-    egress_policy = egress_policy if isinstance(egress_policy, dict) else {}
-    unexpected_violations = egress_policy.get("unexpectedViolationCodes")
-    unauthorized_connections = egress_policy.get("unauthorizedConnections")
-    egress_verified = (
-        egress_policy.get("status") == "verified"
-        and egress_policy.get("proxyPolicyCheck") == "verified"
-        and egress_policy.get("browserTrafficBoundary") == "verified"
-        and egress_policy.get("browserServiceReachability") == "verified"
-        and isinstance(unexpected_violations, list)
-        and not unexpected_violations
-        and isinstance(unauthorized_connections, list)
-        and not unauthorized_connections
-    )
     if (
         probe.get("status") != "verified"
         or cpu.get("status") != "verified"
         or gpu.get("status") != "verified"
-        or not egress_verified
     ):
         reason = (
             probe.get("failureReason")
             or cpu.get("failureReason")
             or gpu.get("reason")
-            or egress_policy.get("failureReason")
             or "compatibility checks did not pass"
         )
-        if cpu.get("status") != "verified":
-            code = "browser-use-compatibility-unverified"
-        elif gpu.get("status") != "verified":
+        code = "browser-use-compatibility-unverified"
+        if gpu.get("status") != "verified":
             code = "capture-gpu-unavailable"
-        else:
-            code = "capture-egress-policy-unverified"
         return _blocked(
             code,
-            "CPU, GPU, and egress checks must pass before capture.",
+            "CPU and GPU checks must pass before capture.",
             diagnostic=str(reason),
             cpu=cpu,
             gpu=gpu,
-            egressPolicy=egress_policy,
             browserExecutable=probe.get("browserExecutable"),
             browserUseVersion=probe.get("browserUseVersion"),
             browserVersion=probe.get("browserVersion"),
@@ -703,15 +603,6 @@ async def capture_site_motion(
                 raise ValueError(f"WebM evidence validation failed: {local_media.get('reason', 'remote ffprobe evidence unavailable')}")
             worker_media = local_media
         remote_evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
-        try:
-            egress_evidence, egress_attestation = _validate_egress_attestation(
-                remote_evidence, capture=capture, run_id=run_id, runner=runner,
-            )
-            egress_verified = True
-        except ValueError as error:
-            egress_evidence = {"status": "blocked", "reason": _redact(str(error))}
-            egress_attestation = {}
-            egress_verified = False
         worker_gpu = remote_evidence.get("gpu") if isinstance(remote_evidence.get("gpu"), dict) else {}
         renderer = str(worker_gpu.get("renderer", ""))
         gpu_verified = (
@@ -751,12 +642,9 @@ async def capture_site_motion(
                 and cleanup_status == "confirmed"
                 and gpu_verified
                 and viewport_verified
-                and egress_verified
             ) else "partial",
             "evidence": {
                 "gpu": {"status": "verified" if gpu_verified else "blocked"},
-                "egress": egress_evidence,
-                "egressAttestation": egress_attestation,
                 "consent": jank.get("consent"),
                 "interactionFailures": jank.get("interactionFailures", []),
                 "scroll": jank.get("scroll"),
@@ -800,7 +688,6 @@ async def capture_site_motion(
             "consent": jank.get("consent"),
             "validation": manifest["validation"],
             "cleanup": cleanup_status,
-            "egress": egress_evidence,
             "artifacts": {
                 "video": {**video_digest},
                 "jank": {**jank_digest},

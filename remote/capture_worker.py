@@ -27,7 +27,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import suppress
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -236,20 +236,6 @@ def _canonical_run_id(value: Any) -> str:
     return value
 
 
-def _validate_proxy_gateway(value: Any) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise ValueError("egress_proxy_host must be a private IPv4 address")
-    try:
-        address = ipaddress.ip_address(value)
-    except ValueError as error:
-        raise ValueError("egress_proxy_host must be a private IPv4 address") from error
-    if address.version != 4 or not address.is_private:
-        raise ValueError("egress_proxy_host must be a private IPv4 address")
-    return address.compressed
-
-
 def _validate_run_location(run_id: str, output_dir: Any, runs_root: Path = RUNS_ROOT) -> Path:
     if not isinstance(output_dir, str) or not Path(output_dir).is_absolute():
         raise ValueError("output_dir must be an absolute path")
@@ -298,7 +284,7 @@ def validate_request(payload: Any, *, runs_root: Path = RUNS_ROOT) -> dict[str, 
         "hover_wait_ms", "click_selectors", "click_selector", "click_wait_ms",
         "auto_discover", "auto_discover_max", "auto_discover_wait_ms",
         "tail_ms", "jank_check", "jank_threshold_ms", "timeout_ms",
-        "overwrite", "gpu_check_id", "egress_proxy_host", "egress_proxy_port",
+        "overwrite", "gpu_check_id",
     }
     unknown = sorted(set(payload) - allowed)
     if unknown:
@@ -368,8 +354,6 @@ def validate_request(payload: Any, *, runs_root: Path = RUNS_ROOT) -> dict[str, 
         "jank_threshold_ms": _bounded_int(payload, "jank_threshold_ms", 200, 0, 60_000),
         "timeout_ms": timeout_ms,
         "overwrite": _required_bool(payload, "overwrite", False),
-        "egress_proxy_host": _validate_proxy_gateway(payload.get("egress_proxy_host")),
-        "egress_proxy_port": _bounded_int(payload, "egress_proxy_port", 0, 0, 65535),
     }
 
 
@@ -428,9 +412,9 @@ def validate_public_http_url(
         addresses = [literal.compressed]
         if not is_public_address(literal.compressed):
             raise WorkerFailure("capture-domain-unverified", "URL host is not a public IP address")
-    elif resolver is None:
-        addresses = ["resolved-and-pinned-by-approved-proxy"]
     else:
+        if resolver is None:
+            resolver = socket.getaddrinfo
         try:
             records = resolver(hostname, port or (443 if parts.scheme == "https" else 80), type=socket.SOCK_STREAM)
         except (OSError, socket.gaierror) as error:
@@ -763,9 +747,7 @@ async def _browser_executable() -> tuple[Path, str]:
 def _clean_chrome_args(
     args: Any,
     port: int,
-    proxy_port: int,
     profile_dir: Path,
-    proxy_host: str = "127.0.0.1",
 ) -> list[str]:
     if not isinstance(args, (list, tuple)) or any(not isinstance(item, str) for item in args):
         raise WorkerFailure("browser-profile-invalid", "BrowserProfile.get_args() did not return argument strings")
@@ -790,10 +772,6 @@ def _clean_chrome_args(
         f"--remote-debugging-port={port}",
         "--remote-debugging-address=127.0.0.1",
         "--remote-allow-origins=http://127.0.0.1",
-        f"--proxy-server=socks5://{proxy_host}:{proxy_port}",
-        "--proxy-bypass-list=<-loopback>",
-        "--disable-quic",
-        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--disable-sync",
         "--disable-default-apps",
         "--disable-notifications",
@@ -1667,71 +1645,6 @@ async def _scroll_page(
     return evidence, consent_checks
 
 
-def _load_egress_attestation(
-    executable: Path,
-    runtime: dict[str, str],
-    approved_host: str,
-    run_id: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    raw_path = os.environ.get("CAPTURE_EGRESS_ATTESTATION_FILE", "")
-    if not raw_path:
-        raise WorkerFailure("capture-egress-attestation-missing", "The root-owned runner egress attestation is not configured")
-    path = Path(raw_path)
-    try:
-        metadata = path.stat()
-        if metadata.st_uid != 0 or metadata.st_mode & 0o022:
-            raise WorkerFailure("capture-egress-attestation-untrusted", "The egress attestation must be root-owned and not group or world writable")
-        attestation = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise WorkerFailure("capture-egress-attestation-invalid", "The runner egress attestation could not be read") from error
-    if not isinstance(attestation, dict):
-        raise WorkerFailure("capture-egress-attestation-invalid", "The runner egress attestation must be an object")
-    checked_at = attestation.get("checkedAt")
-    expires_at = attestation.get("expiresAt") if isinstance(attestation, dict) else None
-    try:
-        checked = datetime.fromisoformat(str(checked_at).replace("Z", "+00:00"))
-        expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-    except ValueError as error:
-        raise WorkerFailure("capture-egress-attestation-invalid", "The egress attestation timestamps are invalid") from error
-    expected_browser_use = runtime["browserUseVersion"]
-    controls = attestation.get("controls") if isinstance(attestation.get("controls"), dict) else {}
-    direct_control = controls.get("direct") if isinstance(controls.get("direct"), dict) else {}
-    proxied_control = controls.get("proxied") if isinstance(controls.get("proxied"), dict) else {}
-    valid = (
-        attestation.get("schemaVersion") == "runner-egress-boundary.v1"
-        and attestation.get("runId") == run_id
-        and isinstance(attestation.get("boundaryId"), str) and bool(attestation["boundaryId"].strip())
-        and attestation.get("runnerInstanceId") == os.environ.get("VAST_INSTANCE_ID")
-        and attestation.get("browserExecutable") == str(executable)
-        and attestation.get("browserVersion") == runtime["browserVersion"]
-        and attestation.get("captureRuntime") == "browser-use"
-        and attestation.get("captureRuntimeVersion") == expected_browser_use
-        and attestation.get("browserUseVersion") == EXPECTED_BROWSER_USE_VERSION
-        and attestation.get("approvedHost") == approved_host
-        and attestation.get("networkNamespaceInode") == os.stat("/proc/self/ns/net").st_ino
-        and attestation.get("directEgressBlocked") is True
-        and attestation.get("proxyPolicy") == "capture-exact-host.v1"
-        and direct_control.get("status") == "blocked"
-        and proxied_control.get("status") == "passed"
-        and checked.tzinfo is not None and expires.tzinfo is not None
-        and expires > now and checked <= now
-        and expires - checked <= timedelta(seconds=120)
-        and now - checked <= timedelta(seconds=120)
-    )
-    if not valid:
-        raise WorkerFailure("capture-egress-attestation-unverified", "The runner egress boundary proof is stale or does not match this capture runtime")
-    return {
-        "status": "verified",
-        "boundaryId": attestation["boundaryId"],
-        "directEgressBlocked": True,
-        "approvedProxyProbe": proxied_control.get("status") == "passed",
-        "proxyPolicy": "capture-exact-host.v1",
-        "approvedHost": approved_host,
-        "networkNamespaceInode": attestation["networkNamespaceInode"],
-    }, attestation
-
-
 async def _browser_runtime_versions(executable: Path) -> dict[str, str]:
     try:
         browser_use_version = importlib.metadata.version("browser-use")
@@ -1815,23 +1728,15 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
         if path.exists() and path.is_symlink():
             return _worker_result("blocked", run_id, reason_code="artifact-symlink", message="Artifact path is a symlink")
     try:
-        domain = validate_public_http_url(request["url"], resolver=None)
+        domain = validate_public_http_url(request["url"])
     except WorkerFailure as error:
         return _worker_result(error.status, run_id, reason_code=error.reason_code, message=str(error))
     try:
         executable, _ = await _browser_executable()
     except WorkerFailure as error:
         return _worker_result(error.status, run_id, reason_code=error.reason_code, message=str(error))
-    if not request.get("egress_proxy_host") or not request.get("egress_proxy_port"):
-        return _worker_result("blocked", run_id, reason_code="capture-egress-boundary-unavailable", message="A runner namespace proxy is required")
     try:
         runtime = await _browser_runtime_versions(executable)
-    except WorkerFailure as error:
-        return _worker_result(error.status, run_id, reason_code=error.reason_code, message=str(error))
-    try:
-        egress_evidence, egress_attestation = _load_egress_attestation(
-            executable, runtime, domain["hostname"], run_id,
-        )
     except WorkerFailure as error:
         return _worker_result(error.status, run_id, reason_code=error.reason_code, message=str(error))
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
@@ -1886,7 +1791,6 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
     cdp_port = 0
     cdp_origin = ""
     profile = None
-    proxy_port = request["egress_proxy_port"]
     request_guard_task: asyncio.Task[None] | None = None
 
     try:
@@ -1910,10 +1814,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
                     request=request,
                 )
             )
-            chrome_args = _clean_chrome_args(
-                profile.get_args(), cdp_port, proxy_port, profile_dir,
-                proxy_host=request["egress_proxy_host"],
-            )
+            chrome_args = _clean_chrome_args(profile.get_args(), cdp_port, profile_dir)
             session = BrowserSession(cdp_url=cdp_origin, browser_profile=profile)
             browser = await asyncio.create_subprocess_exec(
                 str(executable), *chrome_args,
@@ -1923,9 +1824,6 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
                 start_new_session=True,
             )
             browser_stderr_task = asyncio.create_task(_drain_stderr(browser.stderr))
-            browser_namespace_inode = os.stat(f"/proc/{browser.pid}/ns/net").st_ino
-            if browser_namespace_inode != egress_attestation["networkNamespaceInode"]:
-                raise WorkerFailure("capture-egress-namespace-mismatch", "Chrome did not inherit the attested network namespace")
             cdp_info = await wait_for_cdp(cdp_port, browser, timeout=30, stderr_task=browser_stderr_task)
             if not cdp_info.get("browserVersion"):
                 raise WorkerFailure("browser-startup-unverified", "Chrome CDP did not report a browser version")
@@ -2157,8 +2055,6 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
         "consent": {"mode": request["consent_mode"], "verified": bool(consent.get("verified"))},
         "runtime": runtime,
         "gpu": gpu_renderer,
-        "egress": egress_evidence,
-        "egressAttestation": egress_attestation,
         "settle": settle_evidence,
     }
     if video_info and webm_path.is_file() and webm_path.stat().st_size:
