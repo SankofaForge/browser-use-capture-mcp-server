@@ -1,17 +1,84 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import socket
 import subprocess
 import sys
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "remote"))
 import capture_worker as worker
+
+
+def test_recording_recovers_from_transient_inactive_document():
+    async def run():
+        stop = asyncio.Event()
+        frames = []
+
+        class Input:
+            def write(self, frame):
+                frames.append(frame)
+
+            async def drain(self):
+                return None
+
+        class CDP:
+            screenshot_retry_count = 0
+            calls = 0
+
+            async def command(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise worker.CDPError("Not attached to an active page")
+                stop.set()
+                return {"data": base64.b64encode(b"frame").decode()}
+
+        cdp = CDP()
+        await worker._capture_frames(cdp, SimpleNamespace(stdin=Input()), stop)
+        assert frames and all(frame == b"frame" for frame in frames)
+        assert cdp.screenshot_retry_count == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("message", ["Not attached to an active page", "Target closed"])
+def test_recording_fails_on_persistent_or_unrelated_cdp_error(monkeypatch, message):
+    monkeypatch.setattr(worker, "SCREENSHOT_INACTIVE_TIMEOUT_SECONDS", 0)
+
+    class CDP:
+        screenshot_retry_count = 0
+
+        async def command(self, *args, **kwargs):
+            raise worker.CDPError(message)
+
+    async def run():
+        with pytest.raises(worker.WorkerFailure, match=message):
+            await worker._capture_frames(CDP(), SimpleNamespace(stdin=object()), asyncio.Event())
+
+    asyncio.run(run())
+
+
+def test_actor_page_target_does_not_require_agent_focus():
+    class Page:
+        async def get_target_info(self):
+            return {"targetId": "new-tab-target"}
+
+    assert asyncio.run(worker._page_target_id(Page())) == "new-tab-target"
+
+
+def test_actor_page_without_target_fails_closed():
+    class Page:
+        async def get_target_info(self):
+            return {}
+
+    with pytest.raises(worker.WorkerFailure, match="page did not expose its target"):
+        asyncio.run(worker._page_target_id(Page()))
 
 
 def request_payload(root: Path, **overrides):
@@ -154,7 +221,7 @@ def test_unrecognized_fields_are_rejected(tmp_path: Path):
 
 
 def test_public_http_url_uses_the_capture_runner_resolver():
-    result = worker.validate_public_http_url(
+    result = worker.validate_http_url(
         "https://site.example/path",
         resolver=_records_for_address("1.1.1.1"),
     )
@@ -164,25 +231,29 @@ def test_public_http_url_uses_the_capture_runner_resolver():
 
 
 @pytest.mark.parametrize("address", ["127.0.0.1", "10.0.0.8", "169.254.1.2", "100.64.1.2", "192.0.2.9"])
-def test_private_or_non_global_dns_answers_fail_closed(address: str):
-    with pytest.raises(worker.WorkerFailure) as raised:
-        worker.validate_public_http_url(
-            "https://site.example",
-            resolver=_records_for_address(address),
-        )
-
-    assert raised.value.reason_code == "capture-domain-unverified"
+def test_private_or_non_global_dns_answers_are_allowed(address: str):
+    result = worker.validate_http_url(
+        "https://site.example", resolver=_records_for_address(address)
+    )
+    assert result["addresses"] == [address]
 
 
-def test_mixed_public_and_private_dns_answers_fail_closed():
+def test_mixed_public_and_private_dns_answers_are_allowed():
     def resolve(host: str, port: int, type: int):
         return [
             (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("1.1.1.1", port)),
             (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port)),
         ]
 
-    with pytest.raises(worker.WorkerFailure, match="public addresses"):
-        worker.validate_public_http_url("https://site.example", resolver=resolve)
+    result = worker.validate_http_url("https://site.example", resolver=resolve)
+    assert result["addresses"] == ["1.1.1.1", "127.0.0.1"]
+
+
+def test_localhost_capture_target_is_allowed():
+    result = worker.validate_http_url(
+        "http://localhost:8080", resolver=_records_for_address("127.0.0.1")
+    )
+    assert result["addresses"] == ["127.0.0.1"]
 
 
 def test_approved_domain_check_rejects_host_change_before_resolving_it():
@@ -201,7 +272,7 @@ def test_approved_domain_check_rejects_host_change_before_resolving_it():
     assert "outside.example" in str(raised.value)
 
 
-def test_approved_domain_check_revalidates_public_dns():
+def test_approved_domain_check_resolves_target():
     result = worker._validate_approved_domain(
         "https://site.example/path",
         "site.example",
@@ -237,12 +308,12 @@ def test_navigation_waits_for_blank_page_to_leave_initial_document(monkeypatch):
 
 @pytest.mark.parametrize(
     "url",
-    ["file:///etc/passwd", "javascript:alert(1)", "https://user:pass@example.com", "http://localhost"],
+    ["file:///etc/passwd", "javascript:alert(1)", "https://user:pass@example.com"],
 )
 def test_url_policy_rejects_unsupported_or_unsafe_targets(url: str):
     resolver = _records_for_address("1.1.1.1")
     with pytest.raises(worker.WorkerFailure):
-        worker.validate_public_http_url(url, resolver=resolver)
+        worker.validate_http_url(url, resolver=resolver)
 
 
 def test_url_and_diagnostics_redact_sensitive_query_values():
@@ -255,7 +326,8 @@ def test_url_and_diagnostics_redact_sensitive_query_values():
     assert worker._redact_text("cookie=private") == "cookie=[REDACTED]"
 
 
-def test_chrome_args_force_loopback_cdp_and_replace_profile_port(tmp_path: Path):
+def test_chrome_args_force_loopback_cdp_and_replace_profile_port(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("BROWSER_USE_DISABLE_SANDBOX", raising=False)
     args = worker._clean_chrome_args(
         [
             "--headless=new",
@@ -264,6 +336,7 @@ def test_chrome_args_force_loopback_cdp_and_replace_profile_port(tmp_path: Path)
             "--proxy-server=http://untrusted.invalid:8080",
             "--proxy-bypass-list=*",
             "--no-sandbox",
+            "--no-zygote",
             "--user-data-dir",
             "/persistent/profile",
         ],
@@ -282,6 +355,7 @@ def test_chrome_args_force_loopback_cdp_and_replace_profile_port(tmp_path: Path)
     assert "--disable-component-update" not in args
     assert "--disable-sync" in args
     assert "--no-sandbox" not in args
+    assert "--no-zygote" not in args
     assert "--proxy-bypass-list=*" not in args
     assert f"--user-data-dir={tmp_path / 'run-profile'}" in args
     assert "/persistent/profile" not in args
@@ -323,7 +397,8 @@ def test_browser_executable_rejects_launcher_script_before_version_check(tmp_pat
     assert raised.value.reason_code == "browser-executable-wrapper"
 
 
-def test_browser_profile_is_local_bounded_and_run_scoped(tmp_path: Path):
+def test_browser_profile_is_local_bounded_and_run_scoped(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("BROWSER_USE_DISABLE_SANDBOX", raising=False)
     request = make_request(tmp_path, mobile=True, reduced_motion=True)
     profile_dir = tmp_path / "browser-use-user-data-dir-profile"
     options = worker._browser_profile_options(
@@ -346,6 +421,22 @@ def test_browser_profile_is_local_bounded_and_run_scoped(tmp_path: Path):
     assert "is_mobile" not in options
     assert "has_touch" not in options
     assert "reduced_motion" not in options
+
+
+def test_explicit_temporary_runner_sandbox_override(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("BROWSER_USE_DISABLE_SANDBOX", "1")
+    options = worker._browser_profile_options(
+        executable=Path("/opt/google/chrome/chrome"),
+        profile_dir=tmp_path / "browser-use-user-data-dir-profile",
+        cdp_origin="http://127.0.0.1:9222",
+        approved_hostname="example.com",
+        request=make_request(tmp_path),
+    )
+    assert options["chromium_sandbox"] is False
+    assert "--no-sandbox" in worker._clean_chrome_args([], 9222, tmp_path)
+    monkeypatch.setenv("BROWSER_USE_DISABLE_SANDBOX", "0")
+    assert worker._chromium_sandbox_enabled() is True
+    assert "--no-sandbox" not in worker._clean_chrome_args([], 9222, tmp_path)
 
 
 def test_browser_profile_rejects_paths_browser_use_would_copy_outside_run(tmp_path: Path):
