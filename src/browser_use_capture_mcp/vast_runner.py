@@ -33,6 +33,10 @@ BROWSER_USE_RUNTIME_ENV = (
 SSH_URL_PATTERN = re.compile(r"ssh://([^@\s]+)@([^:\s]+):(\d+)")
 MAX_OUTPUT_BYTES = 32 * 1024
 CAPTURE_FINALIZATION_SECONDS = 300
+SSH_READINESS_TIMEOUT_SECONDS = 30
+SSH_READINESS_RETRY_INTERVAL_SECONDS = 1
+SSH_READINESS_PROBE_TIMEOUT_SECONDS = 8
+VAST_STATUS_QUERY_TIMEOUT_SECONDS = 10
 
 
 class VastRunnerError(RuntimeError):
@@ -257,6 +261,84 @@ class VastRunner:
             error_code=error_code,
         )
 
+    async def _provider_state(self) -> tuple[str, str | None]:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                self._vast_cli() or "vastai",
+                "show",
+                "instance",
+                self.instance_id,
+                "--raw",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=os.environ.copy(),
+                start_new_session=True,
+            )
+        except OSError as error:
+            return "unknown", _safe_output(str(error))
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=VAST_STATUS_QUERY_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            await self._terminate_process(process)
+            return "unknown", "Vast instance status query timed out"
+        except asyncio.CancelledError:
+            await self._terminate_process(process)
+            raise
+
+        if process.returncode != 0:
+            diagnostic = _safe_output(stdout + b"\n" + stderr)
+            return "unknown", diagnostic or "Vast instance status query failed"
+        try:
+            result = json.loads(stdout)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            diagnostic = _safe_output(stdout + b"\n" + stderr)
+            return "unknown", diagnostic or "Vast instance status response was invalid"
+        if not isinstance(result, dict):
+            return "unknown", "Vast instance status response was not an object"
+
+        state = result.get("actual_status") or result.get("cur_state") or result.get("status")
+        if not isinstance(state, str) or not state.strip():
+            return "unknown", "Vast instance status response did not include a state"
+        return state.strip(), None
+
+    async def _wait_for_ssh(self, connection: VastConnection) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SSH_READINESS_TIMEOUT_SECONDS
+        last_diagnostic = "SSH readiness probe did not return a diagnostic"
+        while True:
+            try:
+                await self._run_remote(
+                    connection,
+                    "true",
+                    timeout=SSH_READINESS_PROBE_TIMEOUT_SECONDS,
+                    error_code="runner-not-ready",
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except VastRunnerError as error:
+                if error.reason_code not in {"runner-not-ready", "vast-command-timeout"}:
+                    raise
+                last_diagnostic = error.diagnostic or str(error)
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(SSH_READINESS_RETRY_INTERVAL_SECONDS, remaining))
+
+        provider_state, provider_diagnostic = await self._provider_state()
+        diagnostic = f"Provider state: {provider_state}; SSH diagnostic: {last_diagnostic}"
+        if provider_diagnostic:
+            diagnostic += f"; provider status diagnostic: {provider_diagnostic}"
+        raise VastRunnerError(
+            "runner-not-ready",
+            "The configured Vast runner is not ready for SSH",
+            _safe_output(diagnostic),
+        )
+
     async def sync_project(self, connection: VastConnection) -> None:
         required = [
             self.package_root / "pyproject.toml",
@@ -267,6 +349,7 @@ class VastRunner:
         missing = [path.name for path in required if not path.is_file()]
         if missing:
             raise VastRunnerError("capture-worker-unavailable", "The local capture package is incomplete", ", ".join(missing))
+        await self._wait_for_ssh(connection)
         await self._run_remote(
             connection,
             f"mkdir -p {_shell_quote(REMOTE_APP)} {_shell_quote(REMOTE_APP + '/scripts')} "

@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+import browser_use_capture_mcp.vast_runner as vast_runner
 from browser_use_capture_mcp.vast_runner import REMOTE_RUNS, VastConnection, VastRunner, VastRunnerError
 
 
@@ -47,6 +48,165 @@ def test_scp_transfer_rejects_unapproved_remote_directories():
     runner = VastRunner()
     with pytest.raises(VastRunnerError, match="destination is not approved"):
         runner._scp_args(VastConnection("root", "8.8.8.8", 2222), [], "../../tmp")
+
+
+def _complete_package_root(root):
+    for relative in (
+        "pyproject.toml",
+        "uv.lock",
+        "scripts/verify_compatibility.py",
+        "remote/capture_worker.py",
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture", encoding="utf-8")
+    return root
+
+
+def test_sync_project_classifies_ssh_refusal_as_runner_not_ready(monkeypatch, tmp_path):
+    monkeypatch.setattr(vast_runner, "SSH_READINESS_TIMEOUT_SECONDS", 0)
+    runner = VastRunner(package_root=_complete_package_root(tmp_path))
+    calls = []
+
+    async def fail_remote_command(connection, command, **kwargs):
+        calls.append((command, kwargs["error_code"]))
+        raise VastRunnerError(
+            kwargs["error_code"],
+            "The remote runner command failed",
+            "ssh: connect to host 8.8.8.8 port 2222: Connection refused",
+        )
+
+    async def provider_state():
+        return "starting", None
+
+    runner._run_remote = fail_remote_command
+    runner._provider_state = provider_state
+    with pytest.raises(VastRunnerError) as raised:
+        asyncio.run(runner.sync_project(VastConnection("root", "8.8.8.8", 2222)))
+
+    assert raised.value.reason_code == "runner-not-ready"
+    assert calls == [("true", "runner-not-ready")]
+
+
+def test_sync_project_retries_starting_ssh_before_provisioning(monkeypatch, tmp_path):
+    monkeypatch.setattr(vast_runner, "SSH_READINESS_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(vast_runner, "SSH_READINESS_RETRY_INTERVAL_SECONDS", 0.001)
+    runner = VastRunner(package_root=_complete_package_root(tmp_path))
+    remote_commands = []
+    attempts = 0
+
+    async def run_remote(connection, command, **kwargs):
+        nonlocal attempts
+        remote_commands.append(command)
+        if command == "true":
+            attempts += 1
+            if attempts == 1:
+                raise VastRunnerError(
+                    kwargs["error_code"],
+                    "The remote runner command failed",
+                    "ssh: connect to host 8.8.8.8 port 2222: Connection refused",
+                )
+        return b"", b""
+
+    async def run_local(command, **kwargs):
+        return b"", b""
+
+    runner._run_remote = run_remote
+    runner._run_local = run_local
+    runner._ssh_options = lambda: []
+    asyncio.run(runner.sync_project(VastConnection("root", "8.8.8.8", 2222)))
+
+    assert remote_commands[:2] == ["true", "true"]
+    assert remote_commands[2].startswith("mkdir -p ")
+
+
+def test_sync_project_reports_provider_state_and_ssh_diagnostic_on_timeout(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(vast_runner, "SSH_READINESS_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(vast_runner, "SSH_READINESS_RETRY_INTERVAL_SECONDS", 0.001)
+    runner = VastRunner(package_root=_complete_package_root(tmp_path))
+    remote_commands = []
+    provider_queries = []
+
+    async def fail_remote_command(connection, command, **kwargs):
+        remote_commands.append(command)
+        raise VastRunnerError(
+            kwargs["error_code"],
+            "The remote runner command failed",
+            "ssh: connect to host 8.8.8.8 port 2222: Connection timed out",
+        )
+
+    async def provider_state():
+        provider_queries.append(True)
+        return "loading", None
+
+    runner._run_remote = fail_remote_command
+    runner._provider_state = provider_state
+    with pytest.raises(VastRunnerError) as raised:
+        asyncio.run(runner.sync_project(VastConnection("root", "8.8.8.8", 2222)))
+
+    assert raised.value.reason_code == "runner-not-ready"
+    assert "Provider state: loading" in raised.value.diagnostic
+    assert "Connection timed out" in raised.value.diagnostic
+    assert remote_commands and set(remote_commands) == {"true"}
+    assert provider_queries == [True]
+
+
+def test_sync_project_keeps_setup_failure_after_ssh_readiness(tmp_path):
+    runner = VastRunner(package_root=_complete_package_root(tmp_path))
+    remote_commands = []
+    provider_queries = []
+
+    async def fail_project_setup(connection, command, **kwargs):
+        remote_commands.append((command, kwargs["error_code"]))
+        if command != "true":
+            raise VastRunnerError(
+                kwargs["error_code"],
+                "The remote runner command failed",
+                "mkdir: permission denied",
+            )
+        return b"", b""
+
+    async def provider_state():
+        provider_queries.append(True)
+        return "running", None
+
+    runner._run_remote = fail_project_setup
+    runner._provider_state = provider_state
+    with pytest.raises(VastRunnerError) as raised:
+        asyncio.run(runner.sync_project(VastConnection("root", "8.8.8.8", 2222)))
+
+    assert raised.value.reason_code == "vast-project-provision-failed"
+    assert remote_commands[0] == ("true", "runner-not-ready")
+    assert remote_commands[1][1] == "vast-project-provision-failed"
+    assert provider_queries == []
+
+
+def test_provider_state_reads_only_the_status_field(monkeypatch):
+    monkeypatch.setenv("VAST_API_KEY", "state-query-test-key")
+    runner = VastRunner()
+    runner.instance_id = "99"
+    calls = []
+
+    class Process:
+        returncode = 0
+        pid = 456
+
+        async def communicate(self):
+            return b'{"actual_status":"running","api_key":"private"}', b""
+
+    async def create_process(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    state, diagnostic = asyncio.run(runner._provider_state())
+
+    assert state == "running"
+    assert diagnostic is None
+    assert calls[0][0][1:] == ("show", "instance", "99", "--raw")
+    assert calls[0][1]["env"]["VAST_API_KEY"] == "state-query-test-key"
 
 
 def test_copy_remote_files_accepts_the_run_artifacts_directory(tmp_path):
