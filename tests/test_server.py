@@ -106,14 +106,13 @@ def test_granular_requires_all_selectors(monkeypatch):
         _validate_capture_input({"url": "https://example.com", "consent_mode": "granular"})
 
 
-def test_private_dns_answer_is_rejected(monkeypatch):
+def test_private_dns_answer_is_allowed(monkeypatch):
     monkeypatch.setattr(
         socket,
         "getaddrinfo",
         lambda host, port: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))],
     )
-    with pytest.raises(ValueError, match="public IP"):
-        _validate_capture_input({"url": "https://example.com"})
+    assert _validate_capture_input({"url": "https://example.com"})["url"] == "https://example.com"
 
 
 def test_public_capture_bounds_match_remote_worker_contract(monkeypatch):

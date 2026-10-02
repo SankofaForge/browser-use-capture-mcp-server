@@ -34,12 +34,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 
-RUNS_ROOT = Path("/workspace/browser-use-capture/runs")
+RUNS_ROOT = Path("/workspace/bu")
 EXPECTED_BROWSER_USE_VERSION = "0.13.10"
 CONTRACT_VERSION = "capture-cell.v2"
 JANK_SCHEMA_VERSION = "jank-report.v1"
 LONG_TASK_THRESHOLD_MS = 50
 CAPTURE_FPS = 12
+SCREENSHOT_INACTIVE_TIMEOUT_SECONDS = 5
 MAX_REQUEST_BYTES = 1_000_000
 MAX_TIMEOUT_MS = 270_000
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
@@ -372,15 +373,7 @@ def _redacted_url(raw_url: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, urlencode(query), ""))
 
 
-def is_public_address(address: str) -> bool:
-    try:
-        parsed = ipaddress.ip_address(address.split("%", 1)[0])
-    except ValueError:
-        return False
-    return parsed.is_global
-
-
-def validate_public_http_url(
+def validate_http_url(
     raw_url: str,
     resolver: Callable[..., list[tuple[Any, ...]]] | None = socket.getaddrinfo,
 ) -> dict[str, Any]:
@@ -404,14 +397,10 @@ def validate_public_http_url(
         literal = None
     if not hostname:
         raise WorkerFailure("capture-url-invalid", "URL host is empty")
-    if hostname == "localhost" or hostname.endswith((".localhost", ".local", ".internal", ".test", ".invalid")):
-        raise WorkerFailure("capture-domain-unverified", "Local and reserved host names are not allowed")
     if port is not None and not 1 <= port <= 65535:
         raise WorkerFailure("capture-url-invalid", "URL port is invalid")
     if literal is not None:
         addresses = [literal.compressed]
-        if not is_public_address(literal.compressed):
-            raise WorkerFailure("capture-domain-unverified", "URL host is not a public IP address")
     else:
         if resolver is None:
             resolver = socket.getaddrinfo
@@ -420,8 +409,8 @@ def validate_public_http_url(
         except (OSError, socket.gaierror) as error:
             raise WorkerFailure("capture-domain-unverified", "URL host could not be resolved on the capture runner") from error
         addresses = sorted({str(item[0] if len(item) == 1 else item[4][0]) for item in records})
-        if not addresses or any(not is_public_address(address) for address in addresses):
-            raise WorkerFailure("capture-domain-unverified", "URL host does not resolve only to public addresses")
+        if not addresses:
+            raise WorkerFailure("capture-domain-unverified", "URL host did not resolve on the capture runner")
     return {"url": raw_url, "hostname": hostname, "addresses": addresses}
 
 
@@ -444,7 +433,7 @@ def _validate_approved_domain(
             f"Navigation left the approved host during {stage}: observed host {observed}",
             status="partial",
         )
-    validated = validate_public_http_url(raw_url, resolver=resolver)
+    validated = validate_http_url(raw_url, resolver=resolver)
     if validated["hostname"] != approved_hostname:
         raise WorkerFailure("capture-domain-unverified", f"Navigation left the approved host during {stage}", status="partial")
     return validated
@@ -542,6 +531,7 @@ class CDPSocket:
         self.fetch_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
         self.last_network_activity = asyncio.get_running_loop().time()
         self.reader_error: str | None = None
+        self.screenshot_retry_count = 0
 
     async def start(self) -> None:
         self.reader_task = asyncio.create_task(self._read_messages())
@@ -680,6 +670,14 @@ async def _drain_stderr(stream: asyncio.StreamReader | None) -> str:
     return _redact_text(b"".join(tail).decode("utf-8", errors="replace"))
 
 
+async def _page_target_id(page: Any) -> str:
+    target_info = await page.get_target_info()
+    target_id = target_info.get("targetId")
+    if not isinstance(target_id, str) or not target_id:
+        raise WorkerFailure("browser-target-unavailable", "Browser Use page did not expose its target")
+    return target_id
+
+
 async def _target_websocket_url(port: int, target_id: str) -> str:
     targets = await _http_json(f"http://127.0.0.1:{port}/json/list")
     for target in targets:
@@ -744,6 +742,10 @@ async def _browser_executable() -> tuple[Path, str]:
     return executable, _redact_text(output.splitlines()[0])
 
 
+def _chromium_sandbox_enabled() -> bool:
+    return os.environ.get("BROWSER_USE_DISABLE_SANDBOX") != "1"
+
+
 def _clean_chrome_args(
     args: Any,
     port: int,
@@ -762,12 +764,13 @@ def _clean_chrome_args(
             skip_next = False
             continue
         switch = item.partition("=")[0]
-        if switch in value_switches or switch in {"--no-sandbox", "--remote-debugging-pipe"}:
+        if switch in value_switches or switch in {"--no-sandbox", "--no-zygote", "--remote-debugging-pipe"}:
             skip_next = switch in value_switches and "=" not in item
             continue
         filtered.append(item)
     return [
         *filtered,
+        *([] if _chromium_sandbox_enabled() else ["--no-sandbox"]),
         f"--user-data-dir={profile_dir}",
         f"--remote-debugging-port={port}",
         "--remote-debugging-address=127.0.0.1",
@@ -848,7 +851,7 @@ def _browser_profile_options(
         "executable_path": str(executable),
         "user_data_dir": str(profile_dir),
         "headless": True,
-        "chromium_sandbox": True,
+        "chromium_sandbox": _chromium_sandbox_enabled(),
         "keep_alive": False,
         "cdp_url": cdp_origin,
         "use_cloud": False,
@@ -968,6 +971,7 @@ async def _capture_frames(cdp: CDPSocket, process: asyncio.subprocess.Process, s
     loop = asyncio.get_running_loop()
     last_frame_slot = loop.time()
     frame_count = 0
+    inactive_deadline: float | None = None
     while not stop.is_set():
         try:
             response = await cdp.command(
@@ -980,8 +984,19 @@ async def _capture_frames(cdp: CDPSocket, process: asyncio.subprocess.Process, s
                 raise ValueError("empty screenshot")
         except asyncio.CancelledError:
             raise
+        except CDPError as error:
+            if "Not attached to an active page" in str(error):
+                now = loop.time()
+                if inactive_deadline is None:
+                    inactive_deadline = now + SCREENSHOT_INACTIVE_TIMEOUT_SECONDS
+                if now < inactive_deadline:
+                    cdp.screenshot_retry_count += 1
+                    await asyncio.sleep(0.05)
+                    continue
+            raise WorkerFailure("video-recording-failed", f"CDP screenshot capture failed: {_redact_text(error)}", status="partial") from error
         except Exception as error:
             raise WorkerFailure("video-recording-failed", f"CDP screenshot capture failed: {_redact_text(error)}", status="partial") from error
+        inactive_deadline = None
         now = loop.time()
         repeat = max(1, round((now - last_frame_slot) * CAPTURE_FPS))
         last_frame_slot += repeat / CAPTURE_FPS
@@ -1728,7 +1743,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
         if path.exists() and path.is_symlink():
             return _worker_result("blocked", run_id, reason_code="artifact-symlink", message="Artifact path is a symlink")
     try:
-        domain = validate_public_http_url(request["url"])
+        domain = validate_http_url(request["url"])
     except WorkerFailure as error:
         return _worker_result(error.status, run_id, reason_code=error.reason_code, message=str(error))
     try:
@@ -1833,9 +1848,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
                 page = await session.new_page()
 
             if request["consent_preflight"] and request["consent_mode"] != "none":
-                target_id = str(session.agent_focus_target_id or "")
-                if not target_id:
-                    raise WorkerFailure("browser-target-unavailable", "Browser Use did not expose its focused target")
+                target_id = await _page_target_id(page)
                 cdp = await connect_target_cdp(cdp_port, target_id)
                 await cdp.command("Page.enable")
                 await cdp.command("Fetch.enable", {"patterns": [
@@ -1871,9 +1884,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
                 cdp = None
                 page = await session.new_page()
 
-            target_id = str(session.agent_focus_target_id or "")
-            if not target_id:
-                raise WorkerFailure("browser-target-unavailable", "Browser Use did not expose its focused target")
+            target_id = await _page_target_id(page)
             cdp = await connect_target_cdp(cdp_port, target_id)
             await cdp.command("Page.enable")
             await cdp.command("Network.enable")
@@ -2011,6 +2022,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
                     frame_task.cancel()
                     await asyncio.gather(frame_task, return_exceptions=True)
         if cdp:
+            runtime["screenshotRetryCount"] = cdp.screenshot_retry_count
             await _stop_request_guard(cdp, request_guard_task)
             request_guard_task = None
             await cdp.close()

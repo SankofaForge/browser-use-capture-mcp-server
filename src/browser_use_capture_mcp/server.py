@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
-import ipaddress
 import json
 import math
 import os
@@ -110,31 +109,10 @@ def _blocked(reason_code: str, message: str, *, diagnostic: str | None = None, *
     return payload
 
 
-def _public_address(address: str) -> bool:
-    try:
-        parsed = ipaddress.ip_address(address)
-    except ValueError:
-        return False
-    return not any((
-        parsed.is_private,
-        parsed.is_loopback,
-        parsed.is_link_local,
-        parsed.is_reserved,
-        parsed.is_multicast,
-        parsed.is_unspecified,
-    ))
-
-
 def _validate_url(raw_url: str) -> str:
     parsed = urlparse(raw_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
-        raise ValueError("url must be a public HTTP or HTTPS URL without embedded credentials")
-    try:
-        addresses = {item[4][0] for item in __import__("socket").getaddrinfo(parsed.hostname, None)}
-    except OSError as error:
-        raise ValueError("url host could not be resolved safely") from error
-    if not addresses or any(not _public_address(address) for address in addresses):
-        raise ValueError("url must resolve only to public IP addresses")
+        raise ValueError("url must be an HTTP or HTTPS URL without embedded credentials")
     return raw_url
 
 

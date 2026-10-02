@@ -26,12 +26,18 @@ Run the locked compatibility probe on the GPU runner with:
 uv run --locked python scripts/verify_compatibility.py
 ```
 
-Captures run as a dedicated nonroot user. The adapter accepts HTTP(S) public
-URLs, rejects private-address resolution, uses isolated profiles, and validates
+Captures run as a dedicated nonroot user. The adapter accepts HTTP(S) URLs,
+including local and private addresses, uses isolated profiles, and validates
 consent, recording, jank, artifact hashes, and cleanup. It does not create an
 egress attestation or require a proxy or network namespace. Chrome may make
-ordinary service requests during a capture. The target URL remains subject to
-public-address validation.
+ordinary service requests during a capture.
+
+For an explicitly authorized disposable runner, set
+`BROWSER_USE_DISABLE_SANDBOX=1` on the local adapter process. The bridge passes
+this setting to the compatibility probe and capture worker. Chrome then uses
+`--no-sandbox`. Other values keep sandboxing enabled. Remove the setting when
+the temporary session ends, and enforce the runner's approved lifetime through
+its rental teardown process.
 
 ## Recover from a startup timeout
 
