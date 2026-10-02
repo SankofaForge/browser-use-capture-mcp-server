@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 import aiohttp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "remote"))
-from capture_worker import _clean_chrome_args, _seed_profile_preflight_assets
+from capture_worker import _chromium_sandbox_enabled, _clean_chrome_args, _seed_profile_preflight_assets
 
 
 
@@ -509,7 +509,7 @@ async def verify() -> dict[str, object]:
         profile = BrowserProfile(
             executable_path=str(browser_path),
             headless=True,
-            chromium_sandbox=True,
+            chromium_sandbox=_chromium_sandbox_enabled(),
             args=GPU_ARGS,
             user_data_dir=profile_dir,
             allowed_domains=["example.com"],

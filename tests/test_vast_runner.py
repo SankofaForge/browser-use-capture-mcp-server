@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from browser_use_capture_mcp.vast_runner import VastConnection, VastRunner, VastRunnerError
+from browser_use_capture_mcp.vast_runner import REMOTE_RUNS, VastConnection, VastRunner, VastRunnerError
 
 
 def test_worker_payload_maps_legacy_fields_without_schema_leaks():
@@ -20,12 +20,12 @@ def test_worker_payload_maps_legacy_fields_without_schema_leaks():
     payload = VastRunner.build_worker_input(
         capture,
         "707df2a1-f11e-421c-b255-2b0181b13a27",
-        "/workspace/browser-use-capture/runs/707df2a1-f11e-421c-b255-2b0181b13a27",
+        "/workspace/bu/707df2a1-f11e-421c-b255-2b0181b13a27",
     )
 
     assert payload["scroll"] is False
     assert payload["tail_ms"] == 800
-    assert payload["output_dir"] == "/workspace/browser-use-capture/runs/707df2a1-f11e-421c-b255-2b0181b13a27/artifacts"
+    assert payload["output_dir"] == "/workspace/bu/707df2a1-f11e-421c-b255-2b0181b13a27/artifacts"
     assert not {"gpu", "no_scroll", "tail_lines"}.intersection(payload)
 
 
@@ -58,7 +58,7 @@ def test_copy_remote_files_accepts_the_run_artifacts_directory(tmp_path):
         commands.append(command)
 
     runner._run_local = run_local
-    path = "/workspace/browser-use-capture/runs/707df2a1-f11e-421c-b255-2b0181b13a27/artifacts/desktop-full.webm"
+    path = "/workspace/bu/707df2a1-f11e-421c-b255-2b0181b13a27/artifacts/desktop-full.webm"
     asyncio.run(runner._copy_remote_files(VastConnection("root", "8.8.8.8", 2222), [path], tmp_path))
 
     assert path in commands[0][commands[0].index("-P") + 2]
@@ -66,6 +66,7 @@ def test_copy_remote_files_accepts_the_run_artifacts_directory(tmp_path):
 
 def test_browser_use_runtime_disables_remote_telemetry_cloud_and_version_checks(monkeypatch):
     monkeypatch.setenv("BROWSER_USE_CHROMIUM_PATH", "/opt/google chrome/chrome")
+    monkeypatch.delenv("BROWSER_USE_DISABLE_SANDBOX", raising=False)
     environment = VastRunner()._browser_environment()
 
     assert "ANONYMIZED_TELEMETRY=false" in environment
@@ -73,6 +74,9 @@ def test_browser_use_runtime_disables_remote_telemetry_cloud_and_version_checks(
     assert "BROWSER_USE_VERSION_CHECK=false" in environment
     assert "PYTHONDONTWRITEBYTECODE=1" in environment
     assert "BROWSER_USE_CHROMIUM_PATH='/opt/google chrome/chrome'" in environment
+    assert "BROWSER_USE_DISABLE_SANDBOX=0" in environment
+    monkeypatch.setenv("BROWSER_USE_DISABLE_SANDBOX", "1")
+    assert "BROWSER_USE_DISABLE_SANDBOX=1" in VastRunner()._browser_environment()
 
 
 def test_runner_requires_vast_secrets_and_remote_browser(monkeypatch):
@@ -129,12 +133,12 @@ def test_remote_run_cleanup_is_restricted_to_uuid_path(monkeypatch):
 
     monkeypatch.setattr(runner, "_run_remote", fake_run_remote)
     connection = VastConnection("root", "8.8.8.8", 2222)
-    removed = asyncio.run(runner._remove_remote_run(connection, "/workspace/browser-use-capture/runs/not-a-uuid"))
+    removed = asyncio.run(runner._remove_remote_run(connection, "/workspace/bu/not-a-uuid"))
     assert not removed
     assert seen == []
-    removed = asyncio.run(runner._remove_remote_run(connection, "/workspace/browser-use-capture/runs/aa44ec52-ae57-4c73-a574-e824ac649e37"))
+    removed = asyncio.run(runner._remove_remote_run(connection, "/workspace/bu/aa44ec52-ae57-4c73-a574-e824ac649e37"))
     assert removed
-    assert "rm -rf -- '/workspace/browser-use-capture/runs/aa44ec52-ae57-4c73-a574-e824ac649e37'" in seen[0]
+    assert "rm -rf -- '/workspace/bu/aa44ec52-ae57-4c73-a574-e824ac649e37'" in seen[0]
 
 
 def test_remote_termination_waits_for_worker_cleanup(monkeypatch):
@@ -147,7 +151,7 @@ def test_remote_termination_waits_for_worker_cleanup(monkeypatch):
 
     monkeypatch.setattr(runner, "_run_remote", fake_run_remote)
     connection = VastConnection("root", "8.8.8.8", 2222)
-    run_directory = "/workspace/browser-use-capture/runs/aa44ec52-ae57-4c73-a574-e824ac649e37"
+    run_directory = "/workspace/bu/aa44ec52-ae57-4c73-a574-e824ac649e37"
 
     asyncio.run(runner._terminate_remote_run(connection, run_directory))
 
@@ -240,3 +244,9 @@ def test_ssh_url_parser_rejects_non_public_endpoints(monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     with pytest.raises(VastRunnerError, match="non-public"):
         asyncio.run(runner.connection())
+
+
+def test_chrome_singleton_socket_fits_linux_unix_socket_path_limit():
+    run_id = "707df2a1-f11e-421c-b255-2b0181b13a27"
+    socket_path = f"{REMOTE_RUNS}/{run_id}/tmp/.org.chromium.Chromium.XXXXXX/SingletonSocket"
+    assert len(socket_path.encode()) < 108

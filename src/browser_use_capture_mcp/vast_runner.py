@@ -18,7 +18,7 @@ from typing import Any
 
 REMOTE_ROOT = "/workspace/browser-use-capture"
 REMOTE_APP = f"{REMOTE_ROOT}/app"
-REMOTE_RUNS = f"{REMOTE_ROOT}/runs"
+REMOTE_RUNS = "/workspace/bu"
 REMOTE_RUNTIME = f"{REMOTE_ROOT}/runtime"
 REMOTE_PYTHON_INSTALL = f"{REMOTE_RUNTIME}/pythons"
 REMOTE_VENV = f"{REMOTE_RUNTIME}/venv"
@@ -129,6 +129,7 @@ class VastRunner:
     def _browser_environment(self) -> str:
         return (
             f"{BROWSER_USE_RUNTIME_ENV} "
+            f"BROWSER_USE_DISABLE_SANDBOX={'1' if os.environ.get('BROWSER_USE_DISABLE_SANDBOX') == '1' else '0'} "
             f"PYTHONDONTWRITEBYTECODE=1 "
             f"BROWSER_USE_CHROMIUM_PATH={_shell_quote(self.browser_path)}"
         )
@@ -383,7 +384,7 @@ class VastRunner:
 
     async def _copy_remote_files(self, connection: VastConnection, remote_paths: list[str], local_directory: Path) -> None:
         if not remote_paths or any(
-            not re.fullmatch(r"/workspace/browser-use-capture/runs/[0-9a-f-]{36}/(?:artifacts/)?[A-Za-z0-9._-]{1,120}", path)
+            not re.fullmatch(r"/workspace/bu/[0-9a-f-]{36}/(?:artifacts/)?[A-Za-z0-9._-]{1,120}", path)
             for path in remote_paths
         ):
             raise VastRunnerError("capture-artifact-transfer-failed", "The remote artifact list is invalid")
@@ -395,7 +396,7 @@ class VastRunner:
         await self._run_local(command, timeout=270, error_code="capture-artifact-transfer-failed")
 
     async def _terminate_remote_run(self, connection: VastConnection, run_directory: str) -> None:
-        if not re.fullmatch(r"/workspace/browser-use-capture/runs/[0-9a-f-]{36}", run_directory):
+        if not re.fullmatch(r"/workspace/bu/[0-9a-f-]{36}", run_directory):
             return
         pid_path = f"{run_directory}/worker.pid"
         command = (
@@ -413,7 +414,7 @@ class VastRunner:
             pass
 
     async def _remove_remote_run(self, connection: VastConnection, run_directory: str) -> bool:
-        if not re.fullmatch(r"/workspace/browser-use-capture/runs/[0-9a-f-]{36}", run_directory):
+        if not re.fullmatch(r"/workspace/bu/[0-9a-f-]{36}", run_directory):
             return False
         try:
             await self._run_remote(connection, f"rm -rf -- {_shell_quote(run_directory)}", timeout=30)
