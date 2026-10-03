@@ -156,6 +156,14 @@ def _output_directory(value: Any) -> Path:
     return output_dir
 
 
+def _capture_target_error(targets: dict[str, Path], overwrite: bool) -> dict[str, Any] | None:
+    if _has_symlink_targets(targets):
+        return _blocked("capture-target-symlink", "Capture output targets must not be symbolic links")
+    if not overwrite and any(path.exists() for path in targets.values()):
+        return _blocked("capture-target-exists", "One or more capture artifacts already exist; set overwrite=true to replace them")
+    return None
+
+
 def _validate_capture_input(input_data: dict[str, Any]) -> dict[str, Any]:
     url = _validate_url(str(input_data.get("url", "")))
     consent_mode = input_data.get("consent_mode", "reject")
@@ -426,8 +434,27 @@ async def _compatibility_result(runner: VastRunner) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def check_capture_gpu() -> dict[str, Any]:
-    """Verify the Vast runner, pinned Browser Use session, recording, jank instrumentation, and NVIDIA WebGL renderer."""
+async def check_capture_gpu(dry_run: bool = False) -> dict[str, Any]:
+    """Check runner, browser, recording, jank, and NVIDIA WebGL support. With dry_run=true, return the checks without contacting the runner."""
+    try:
+        dry_run = _bool_option(dry_run, "dry_run")
+    except ValueError as error:
+        return _blocked("capture-input-invalid", str(error))
+    if dry_run:
+        return {
+            "contractVersion": CONTRACT_VERSION,
+            "status": "dry_run",
+            "dryRun": True,
+            "reasonCode": "dry_run.runner_check_not_started",
+            "plannedChecks": [
+                "Validate Vast runner configuration",
+                "Check Browser Use and Chrome compatibility",
+                "Check video recording and jank instrumentation",
+                "Check NVIDIA WebGL rendering",
+            ],
+            "runnerStarted": False,
+            "networkRequestsSent": False,
+        }
     gate = _browser_use_compatibility_gate()
     if gate:
         return gate
@@ -467,21 +494,17 @@ async def capture_site_motion(
     timeout_ms: int = 180000,
     overwrite: bool = False,
     gpu_check_id: str | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Capture one deterministic motion-evidence cell on the configured Vast GPU runner."""
+    """Capture one motion-evidence cell. With dry_run=true, validate and return its plan without starting a runner or writing files."""
     raw = locals().copy()
     raw.pop("gpu_check_id")
+    raw.pop("dry_run")
     try:
+        dry_run = _bool_option(dry_run, "dry_run")
         capture = _validate_capture_input(raw)
     except (TypeError, ValueError) as error:
         return _blocked("capture-input-invalid", str(error))
-    runner = VastRunner()
-    gate = _browser_use_compatibility_gate()
-    if gate:
-        return _redact_output({**gate, "url": capture["url"], "consent": {"mode": capture["consent_mode"], "verified": False}})
-    capability_gate = _verified_capability(gpu_check_id, runner)
-    if capability_gate:
-        return _redact_output({**capability_gate, "url": capture["url"], "consent": {"mode": capture["consent_mode"], "verified": False}})
 
     output_dir = capture["output_dir"]
     stem = capture["name"]
@@ -490,10 +513,44 @@ async def capture_site_motion(
         "jank": output_dir / f"{stem}.jank.json",
         "manifest": output_dir / f"{stem}.capture-cell.v2.json",
     }
-    if _has_symlink_targets(targets):
-        return _blocked("capture-target-symlink", "Capture output targets must not be symbolic links")
-    if not capture["overwrite"] and any(path.exists() for path in targets.values()):
-        return _blocked("capture-target-exists", "One or more capture artifacts already exist; set overwrite=true to replace them")
+    if dry_run:
+        target_error = _capture_target_error(targets, capture["overwrite"])
+        if target_error:
+            return target_error
+        return {
+            "contractVersion": CONTRACT_VERSION,
+            "status": "dry_run",
+            "dryRun": True,
+            "reasonCode": "dry_run.capture_not_started",
+            "url": _redact_url(capture["url"]),
+            "viewport": {"width": capture["width"], "height": capture["height"]},
+            "modes": {
+                "mobile": capture["mobile"],
+                "reducedMotion": capture["reduced_motion"],
+                "gpu": capture["gpu"],
+                "scroll": not capture["no_scroll"],
+            },
+            "consent": {"mode": capture["consent_mode"], "verified": False},
+            "timeoutMs": capture["timeout_ms"],
+            "outputDir": str(output_dir),
+            "plannedArtifacts": {name: str(path) for name, path in targets.items()},
+            "overwrite": capture["overwrite"],
+            "runnerStarted": False,
+            "networkRequestsSent": False,
+            "filesystemWrites": False,
+        }
+    runner = VastRunner()
+    gate = _browser_use_compatibility_gate()
+    if gate:
+        return _redact_output({**gate, "url": capture["url"], "consent": {"mode": capture["consent_mode"], "verified": False}})
+    capability_gate = _verified_capability(gpu_check_id, runner)
+    if capability_gate:
+        return _redact_output({**capability_gate, "url": capture["url"], "consent": {"mode": capture["consent_mode"], "verified": False}})
+
+    target_error = _capture_target_error(targets, capture["overwrite"])
+    if target_error:
+        return target_error
+
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
         stage_dir = Path(tempfile.mkdtemp(prefix=f".{stem}-{uuid.uuid4().hex[:8]}-", dir=output_dir))
