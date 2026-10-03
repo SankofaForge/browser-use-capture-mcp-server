@@ -5,6 +5,13 @@ This local stdio MCP server exposes `check_capture_gpu` and
 connects to a rented Linux GPU runner over its current Vast SSH endpoint;
 Browser Use and Chrome run on that runner.
 
+Both tools accept `dry_run` (default `false`). With `dry_run=true`,
+`check_capture_gpu` lists its planned checks without contacting the runner.
+`capture_site_motion` validates the inputs and local artifact targets, then
+returns the capture settings and planned file names. It does not start a runner,
+send network requests, or write files. A dry run does not verify GPU support,
+reach the target site, or confirm consent behavior.
+
 The compatibility probe checks the pinned Browser Use API, Chrome startup and
 CDP attachment, page evaluation, viewport and reduced-motion controls, jank
 collection, WebM recording, cleanup, and hardware-backed WebGL. A fresh
