@@ -22,7 +22,10 @@ from urllib.parse import urlparse
 import aiohttp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "remote"))
-from capture_worker import _chromium_sandbox_enabled, _clean_chrome_args, _seed_profile_preflight_assets
+from capture_worker import (
+    _chromium_sandbox_enabled, _clean_chrome_args, _seed_profile_preflight_assets,
+    _page_target_id, connect_target_cdp, start_native_recording, stop_native_recording,
+)
 
 
 
@@ -251,67 +254,6 @@ async def _page_cdp_transport(page: Any) -> tuple[Any, str]:
     return client, session_id
 
 
-class _CDPScreenshotClient:
-    """Capture page frames through CDP and feed Browser Use's video recorder."""
-
-    def __init__(self, websocket: Any, session_id: str):
-        self.websocket = websocket
-        self.session_id = session_id
-        self.next_id = 1
-
-    async def capture_png_base64(self) -> str:
-        request_id = self.next_id
-        self.next_id += 1
-        await self.websocket.send_json({
-            "id": request_id,
-            "method": "Page.captureScreenshot",
-            "params": {"format": "png", "fromSurface": True, "captureBeyondViewport": False},
-            "sessionId": self.session_id,
-        })
-        while True:
-            message = await asyncio.wait_for(self.websocket.receive_json(), timeout=5)
-            if message.get("id") != request_id:
-                continue
-            if "error" in message:
-                raise RuntimeError("CDP screenshot capture failed")
-            data = message.get("result", {}).get("data")
-            if not isinstance(data, str) or not data:
-                raise RuntimeError("CDP screenshot capture returned no image")
-            return data
-
-
-async def _attach_screenshot_client(websocket_url: str, target_id: str) -> tuple[Any, Any, _CDPScreenshotClient]:
-    client_session = aiohttp.ClientSession()
-    try:
-        websocket = await client_session.ws_connect(websocket_url, heartbeat=10)
-        await websocket.send_json({
-            "id": 1,
-            "method": "Target.attachToTarget",
-            "params": {"targetId": target_id, "flatten": True},
-        })
-        while True:
-            message = await asyncio.wait_for(websocket.receive_json(), timeout=5)
-            if message.get("id") != 1:
-                continue
-            if "error" in message:
-                raise RuntimeError("CDP could not attach to the active Browser Use page")
-            session_id = message.get("result", {}).get("sessionId")
-            if not isinstance(session_id, str):
-                raise RuntimeError("CDP did not return a page session")
-            await websocket.send_json({"id": 2, "method": "Page.enable", "sessionId": session_id})
-            while True:
-                enabled = await asyncio.wait_for(websocket.receive_json(), timeout=5)
-                if enabled.get("id") != 2:
-                    continue
-                if "error" in enabled:
-                    raise RuntimeError("CDP could not enable page recording")
-                break
-            return client_session, websocket, _CDPScreenshotClient(websocket, session_id)
-    except BaseException:
-        await client_session.close()
-        raise
-
-
 async def _record_browser_use_video(
     websocket_url: str,
     page: Any,
@@ -320,29 +262,21 @@ async def _record_browser_use_video(
     height: int,
     seconds: float = 3.5,
 ) -> None:
-    from browser_use.browser.video_recorder import VideoRecorderService  # type: ignore[import-not-found]
-
-    target_id = getattr(page, "_target_id", None)
-    if not isinstance(target_id, str) or not target_id:
-        raise RuntimeError("Browser Use did not expose the active page target for recording")
-    client_session, websocket, screenshot_client = await _attach_screenshot_client(websocket_url, target_id)
-    recorder = VideoRecorderService(output_path=output_path, size={"width": width, "height": height}, framerate=10)
-    recorder.start()
+    port = urlparse(websocket_url).port
+    if port is None:
+        raise RuntimeError("Chrome CDP endpoint has no port")
+    cdp = await connect_target_cdp(port, await _page_target_id(page))
+    session = None
     try:
-        deadline = asyncio.get_running_loop().time() + max(seconds, 5.0)
-        frames = 0
-        while frames < 12 and asyncio.get_running_loop().time() < deadline:
-            recorder.add_frame(await screenshot_client.capture_png_base64())
-            frames += 1
-            await asyncio.sleep(0.02)
-        if frames < 10:
-            raise RuntimeError(f"Browser Use recorder received too few frames: {frames}")
+        await cdp.command("Page.enable")
+        session = await start_native_recording(cdp, width, height, output_path)
+        await asyncio.sleep(seconds)
     finally:
-        recorder.stop_and_save()
-        await websocket.close()
-        await client_session.close()
-    if not output_path.is_file() or output_path.stat().st_size == 0:
-        raise RuntimeError("Browser Use video recorder produced no media file")
+        try:
+            if session:
+                await asyncio.wait_for(stop_native_recording(cdp, session, output_path), timeout=60)
+        finally:
+            await cdp.close()
 
 
 async def _install_jank_observer(session: Any, page: Any) -> None:
@@ -501,7 +435,7 @@ async def verify() -> dict[str, object]:
 
     with tempfile.TemporaryDirectory(prefix="bu-compat-", dir="/tmp", ignore_cleanup_errors=True) as temporary:
         root = Path(temporary)
-        recording_path = root / "compatibility.mp4"
+        recording_path = root / "compatibility-source.mp4"
         webm_path = root / "compatibility.webm"
         profile_dir = root / "browser-use-user-data-dir-profile"
         profile_dir.mkdir()
@@ -541,6 +475,7 @@ async def verify() -> dict[str, object]:
             await _stop_process(browser_process)
             browser_process = None
             recording = _convert_to_webm(recording_path, webm_path)
+            recording["backend"] = "chrome-screencast"
             gpu = _gpu_status(renderer)
             cpu_verified = domain_restriction and jank_entries is not None and recording.get("status") == "valid"
             return {

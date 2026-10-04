@@ -16,52 +16,112 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "remote"))
 import capture_worker as worker
 
 
-def test_recording_recovers_from_transient_inactive_document():
-    async def run():
-        stop = asyncio.Event()
-        frames = []
-
-        class Input:
-            def write(self, frame):
-                frames.append(frame)
-
-            async def drain(self):
-                return None
-
-        class CDP:
-            screenshot_retry_count = 0
-            calls = 0
-
-            async def command(self, *args, **kwargs):
-                self.calls += 1
-                if self.calls == 1:
-                    raise worker.CDPError("Not attached to an active page")
-                stop.set()
-                return {"data": base64.b64encode(b"frame").decode()}
-
-        cdp = CDP()
-        await worker._capture_frames(cdp, SimpleNamespace(stdin=Input()), stop)
-        assert frames and all(frame == b"frame" for frame in frames)
-        assert cdp.screenshot_retry_count == 1
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("message", ["Not attached to an active page", "Target closed"])
-def test_recording_fails_on_persistent_or_unrelated_cdp_error(monkeypatch, message):
-    monkeypatch.setattr(worker, "SCREENSHOT_INACTIVE_TIMEOUT_SECONDS", 0)
+def test_native_recording_uses_chrome_encoder_and_requested_viewport():
+    calls = []
 
     class CDP:
-        screenshot_retry_count = 0
+        async def command(self, method, params=None, **kwargs):
+            calls.append((method, params))
+            return {}
 
-        async def command(self, *args, **kwargs):
-            raise worker.CDPError(message)
+    session = asyncio.run(worker.start_native_recording(CDP(), 1440, 1000))
 
-    async def run():
-        with pytest.raises(worker.WorkerFailure, match=message):
-            await worker._capture_frames(CDP(), SimpleNamespace(stdin=object()), asyncio.Event())
+    assert isinstance(session, worker.ScreencastRecordingSession)
+    assert calls == [
+        ("Page.bringToFront", None),
+        ("Page.startScreencast", {"format": "jpeg", "quality": 80, "maxWidth": 1440, "maxHeight": 1000, "everyNthFrame": 1}),
+    ]
 
-    asyncio.run(run())
+
+def test_native_recording_handles_screencast_frames_and_acks(tmp_path):
+    calls = []
+
+    class CDP:
+        def __init__(self):
+            self.screencast_handler = None
+
+        async def command(self, method, params=None, **kwargs):
+            calls.append((method, params))
+            return {}
+
+        async def ack_screencast_frame(self, session_id):
+            calls.append(("Page.screencastFrameAck", {"sessionId": session_id}))
+
+    cdp = CDP()
+    output = tmp_path / "native.mp4"
+    session = asyncio.run(worker.start_native_recording(cdp, 1280, 720))
+    assert cdp.screencast_handler is not None
+
+    frame_bytes = b"\xff\xd8\xff\xe0testjpeg"
+    frame_b64 = base64.b64encode(frame_bytes).decode()
+
+    asyncio.run(session.handle_frame({
+        "data": frame_b64,
+        "sessionId": 42,
+        "metadata": {"timestamp": 1234.56},
+    }))
+
+    assert ("Page.screencastFrameAck", {"sessionId": 42}) in calls
+    assert session.latest_frame == frame_bytes
+
+    output.write_bytes(frame_bytes)
+    size = asyncio.run(worker.stop_native_recording(cdp, session, output))
+    assert size == len(frame_bytes)
+    assert any(c[0] == "Page.stopScreencast" for c in calls)
+
+
+def test_native_recording_rejects_empty_output(tmp_path):
+    calls = []
+
+    class CDP:
+        async def command(self, method, params=None, **kwargs):
+            calls.append(method)
+            return {}
+
+    output = tmp_path / "native.mp4"
+    output.write_bytes(b"")
+
+    cdp = CDP()
+    session = asyncio.run(worker.start_native_recording(cdp, 1280, 720))
+    with pytest.raises(worker.WorkerFailure) as raised:
+        asyncio.run(worker.stop_native_recording(cdp, session, output))
+
+    assert raised.value.reason_code == "video-recording-failed"
+    assert raised.value.status == "partial"
+    assert "Page.stopScreencast" in calls
+
+
+def test_native_recording_unavailable_does_not_fall_back_to_screenshots():
+    class CDP:
+        async def command(self, method, params=None, **kwargs):
+            if method == "Page.startScreencast":
+                raise worker.CDPError("Method not found")
+            assert method == "Page.bringToFront"
+            return {}
+
+    with pytest.raises(worker.WorkerFailure, match="CDPError: Method not found") as raised:
+        asyncio.run(worker.start_native_recording(CDP(), 390, 844))
+    assert raised.value.reason_code == "native-recording-unavailable"
+
+
+def test_native_recording_cancellation_closes_stream(tmp_path):
+    calls = []
+
+    class CDP:
+        async def command(self, method, params=None, **kwargs):
+            calls.append(method)
+            if method == "Page.stopScreencast":
+                raise asyncio.CancelledError
+            return {}
+
+    output = tmp_path / "native.mp4"
+    output.write_bytes(b"video-data")
+
+    cdp = CDP()
+    session = asyncio.run(worker.start_native_recording(cdp, 1280, 720))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(worker.stop_native_recording(cdp, session, output))
+    assert "Page.stopScreencast" in calls
 
 
 def test_actor_page_target_does_not_require_agent_focus():
@@ -129,6 +189,7 @@ def test_scroll_awaits_actor_mouse_and_preserves_failure_kind(tmp_path, capsys, 
     assert evidence["timedOut"] is isinstance(failure, TimeoutError)
     if failure is not None:
         assert type(failure).__name__ in capsys.readouterr().err
+
 
 
 @pytest.mark.parametrize("mobile", [False, True])
@@ -837,6 +898,6 @@ def test_missing_ffmpeg_is_a_structured_failure(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(worker.shutil, "which", lambda _name: None)
 
     with pytest.raises(worker.WorkerFailure) as raised:
-        asyncio.run(worker.start_ffmpeg_recorder(tmp_path / "source.mp4"))
+        asyncio.run(worker.convert_and_validate_video(tmp_path / "source.webm", tmp_path / "output.webm"))
 
-    assert raised.value.reason_code == "ffmpeg-unavailable"
+    assert raised.value.reason_code == "media-tools-unavailable"

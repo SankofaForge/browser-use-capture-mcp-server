@@ -39,8 +39,7 @@ EXPECTED_BROWSER_USE_VERSION = "0.13.10"
 CONTRACT_VERSION = "capture-cell.v2"
 JANK_SCHEMA_VERSION = "jank-report.v1"
 LONG_TASK_THRESHOLD_MS = 50
-CAPTURE_FPS = 12
-SCREENSHOT_INACTIVE_TIMEOUT_SECONDS = 5
+CAPTURE_FPS = 30
 MAX_REQUEST_BYTES = 1_000_000
 MAX_TIMEOUT_MS = 270_000
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
@@ -531,9 +530,15 @@ class CDPSocket:
         self.reader_task: asyncio.Task[None] | None = None
         self.in_flight_requests: set[str] = set()
         self.fetch_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
+        self.screencast_handler: Callable[[dict[str, Any]], Any] | None = None
         self.last_network_activity = asyncio.get_running_loop().time()
         self.reader_error: str | None = None
-        self.screenshot_retry_count = 0
+
+    def set_screencast_handler(self, handler: Callable[[dict[str, Any]], Any] | None) -> None:
+        self.screencast_handler = handler
+
+    async def ack_screencast_frame(self, session_id: int) -> None:
+        await self.command("Page.screencastFrameAck", {"sessionId": session_id}, timeout=5)
 
     async def start(self) -> None:
         self.reader_task = asyncio.create_task(self._read_messages())
@@ -566,6 +571,14 @@ class CDPSocket:
                     self.last_network_activity = now
                 elif method == "Fetch.requestPaused":
                     await self.fetch_events.put(params)
+                elif method == "Page.screencastFrame":
+                    if self.screencast_handler is not None:
+                        try:
+                            res = self.screencast_handler(params)
+                            if asyncio.iscoroutine(res):
+                                asyncio.create_task(res)
+                        except Exception as error:
+                            _log(f"screencast_handler error: {error}")
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -914,6 +927,16 @@ async def cleanup_browser_lifecycle(session: Any, process: asyncio.subprocess.Pr
     return await _terminate_browser(process) and cleanup_ok
 
 
+def _safe_delete_tree(path: Path | None) -> bool:
+    if path is None or not path.exists():
+        return True
+    try:
+        shutil.rmtree(path)
+        return not path.exists()
+    except OSError:
+        return False
+
+
 async def _terminate_ffmpeg(process: asyncio.subprocess.Process | None) -> bool:
     if process is None:
         return True
@@ -940,77 +963,204 @@ async def _terminate_ffmpeg(process: asyncio.subprocess.Process | None) -> bool:
     return process.returncode == 0
 
 
-def _safe_delete_tree(path: Path | None) -> bool:
-    if path is None or not path.exists():
-        return True
-    try:
-        shutil.rmtree(path)
-        return not path.exists()
-    except OSError:
-        return False
-
-
-async def start_ffmpeg_recorder(path: Path) -> tuple[asyncio.subprocess.Process, asyncio.Task[str]]:
+async def start_ffmpeg_recorder(path: Path, fps: int = CAPTURE_FPS) -> tuple[asyncio.subprocess.Process, asyncio.Task[str]]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise WorkerFailure("ffmpeg-unavailable", "ffmpeg is required for WebM capture")
+        raise WorkerFailure("media-tools-unavailable", "ffmpeg is required for video capture")
     process = await asyncio.create_subprocess_exec(
         ffmpeg,
         "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "image2pipe", "-vcodec", "mjpeg", "-framerate", str(CAPTURE_FPS), "-i", "pipe:0",
+        "-f", "image2pipe", "-vcodec", "mjpeg", "-framerate", str(fps), "-i", "pipe:0",
         "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart", str(path),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     return process, asyncio.create_task(_drain_stderr(process.stderr))
 
 
-async def _capture_frames(cdp: CDPSocket, process: asyncio.subprocess.Process, stop: asyncio.Event) -> int:
-    if process.stdin is None:
-        raise WorkerFailure("video-recording-failed", "ffmpeg has no input pipe")
-    loop = asyncio.get_running_loop()
-    last_frame_slot = loop.time()
-    frame_count = 0
-    inactive_deadline: float | None = None
-    while not stop.is_set():
+class ScreencastRecordingSession:
+    """Manages the lifecycle of an active Chrome screencast recording."""
+
+    def __init__(
+        self,
+        cdp: Any,
+        ffmpeg_process: asyncio.subprocess.Process | None = None,
+        stderr_task: asyncio.Task[str] | None = None,
+        output_path: Path | None = None,
+        fps: int = CAPTURE_FPS,
+    ) -> None:
+        self.cdp = cdp
+        self.ffmpeg_process = ffmpeg_process
+        self.stderr_task = stderr_task
+        self.output_path = output_path
+        self.fps = fps
+        self.stop_event = asyncio.Event()
+        self.first_frame_event = asyncio.Event()
+        self.latest_frame: bytes | None = None
+        self.frame_count = 0
+        self.pump_task: asyncio.Task[int] | None = None
+
+    async def handle_frame(self, params: dict[str, Any]) -> None:
+        data = params.get("data")
+        session_id = params.get("sessionId")
+        if isinstance(data, str) and data:
+            try:
+                self.latest_frame = base64.b64decode(data, validate=True)
+                self.first_frame_event.set()
+            except Exception as error:
+                _log(f"Invalid screencast frame data: {error}")
+        if session_id is not None:
+            try:
+                if hasattr(self.cdp, "ack_screencast_frame"):
+                    await self.cdp.ack_screencast_frame(session_id)
+                elif hasattr(self.cdp, "command"):
+                    await self.cdp.command("Page.screencastFrameAck", {"sessionId": session_id}, timeout=5)
+            except Exception as error:
+                _log(f"screencastFrameAck failed: {error}")
+
+    async def pump_frames(self) -> int:
+        if self.ffmpeg_process is None or self.ffmpeg_process.stdin is None:
+            return 0
         try:
-            response = await cdp.command(
-                "Page.captureScreenshot",
-                {"format": "jpeg", "quality": 82, "fromSurface": True, "captureBeyondViewport": False, "optimizeForSpeed": True},
-                timeout=10,
-            )
-            frame = base64.b64decode(response["data"], validate=True)
-            if not frame:
-                raise ValueError("empty screenshot")
-        except asyncio.CancelledError:
-            raise
-        except CDPError as error:
-            if "Not attached to an active page" in str(error):
-                now = loop.time()
-                if inactive_deadline is None:
-                    inactive_deadline = now + SCREENSHOT_INACTIVE_TIMEOUT_SECONDS
-                if now < inactive_deadline:
-                    cdp.screenshot_retry_count += 1
-                    await asyncio.sleep(0.05)
-                    continue
-            raise WorkerFailure("video-recording-failed", f"CDP screenshot capture failed: {_redact_text(error)}", status="partial") from error
-        except Exception as error:
-            raise WorkerFailure("video-recording-failed", f"CDP screenshot capture failed: {_redact_text(error)}", status="partial") from error
-        inactive_deadline = None
-        now = loop.time()
-        repeat = max(1, round((now - last_frame_slot) * CAPTURE_FPS))
-        last_frame_slot += repeat / CAPTURE_FPS
-        try:
-            for _ in range(repeat):
-                process.stdin.write(frame)
-                await process.stdin.drain()
-                frame_count += 1
-        except (BrokenPipeError, ConnectionResetError) as error:
-            raise WorkerFailure("video-recording-failed", "ffmpeg stopped accepting captured frames", status="partial") from error
-        await asyncio.sleep(max(0, 1 / CAPTURE_FPS - (loop.time() - now)))
-    return frame_count
+            await asyncio.wait_for(self.first_frame_event.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            if self.stop_event.is_set():
+                return 0
+            raise WorkerFailure("video-recording-failed", "No screencast frames received from Chrome", status="partial")
+
+        loop = asyncio.get_running_loop()
+        interval = 1.0 / self.fps
+        next_tick = loop.time()
+
+        while not self.stop_event.is_set():
+            if self.latest_frame is not None:
+                try:
+                    self.ffmpeg_process.stdin.write(self.latest_frame)
+                    await self.ffmpeg_process.stdin.drain()
+                    self.frame_count += 1
+                except (BrokenPipeError, ConnectionResetError) as error:
+                    raise WorkerFailure(
+                        "video-recording-failed", "ffmpeg stopped accepting captured frames", status="partial"
+                    ) from error
+            next_tick += interval
+            sleep_time = next_tick - loop.time()
+            if sleep_time > 0:
+                try:
+                    await asyncio.wait_for(self.stop_event.wait(), timeout=sleep_time)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                if next_tick < loop.time() - interval:
+                    next_tick = loop.time()
+
+        if self.latest_frame is not None and self.frame_count > 0:
+            try:
+                self.ffmpeg_process.stdin.write(self.latest_frame)
+                await self.ffmpeg_process.stdin.drain()
+                self.frame_count += 1
+            except Exception:
+                pass
+
+        return self.frame_count
+
+
+async def start_native_recording(
+    cdp: Any,
+    width: int,
+    height: int,
+    output_path: Path | None = None,
+) -> ScreencastRecordingSession:
+    try:
+        await cdp.command("Page.bringToFront")
+        await cdp.command(
+            "Page.startScreencast",
+            {"format": "jpeg", "quality": 80, "maxWidth": width, "maxHeight": height, "everyNthFrame": 1},
+        )
+    except Exception as error:
+        raise WorkerFailure(
+            "native-recording-unavailable",
+            f"Chrome native recording could not start: {type(error).__name__}: {_redact_text(error)}",
+        ) from error
+
+    ffmpeg_process = None
+    stderr_task = None
+    if output_path is not None:
+        ffmpeg_process, stderr_task = await start_ffmpeg_recorder(output_path)
+
+    session = ScreencastRecordingSession(
+        cdp=cdp,
+        ffmpeg_process=ffmpeg_process,
+        stderr_task=stderr_task,
+        output_path=output_path,
+        fps=CAPTURE_FPS,
+    )
+
+    def on_frame_sync(params: dict[str, Any]) -> None:
+        asyncio.create_task(session.handle_frame(params))
+
+    if hasattr(cdp, "set_screencast_handler"):
+        cdp.set_screencast_handler(on_frame_sync)
+    elif hasattr(cdp, "screencast_handler"):
+        cdp.screencast_handler = on_frame_sync
+
+    if ffmpeg_process is not None:
+        session.pump_task = asyncio.create_task(session.pump_frames())
+
+    return session
+
+
+async def stop_native_recording(
+    cdp: Any,
+    session: Any,
+    path: Path | None = None,
+) -> int:
+    target_path = path or getattr(session, "output_path", None)
+    if isinstance(session, ScreencastRecordingSession):
+        session.stop_event.set()
+
+    try:
+        if hasattr(cdp, "command"):
+            await cdp.command("Page.stopScreencast", timeout=15)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        _log(f"Page.stopScreencast failed: {error}")
+    finally:
+        if hasattr(cdp, "set_screencast_handler"):
+            cdp.set_screencast_handler(None)
+        elif hasattr(cdp, "screencast_handler"):
+            cdp.screencast_handler = None
+
+    if isinstance(session, ScreencastRecordingSession):
+        if session.pump_task is not None:
+            try:
+                await asyncio.wait_for(session.pump_task, timeout=12)
+            except Exception as error:
+                if not session.pump_task.done():
+                    session.pump_task.cancel()
+                    await asyncio.gather(session.pump_task, return_exceptions=True)
+                raise WorkerFailure(
+                    "video-recording-failed",
+                    f"Frame pump failed: {type(error).__name__}: {_redact_text(error)}",
+                    status="partial",
+                ) from error
+        if session.ffmpeg_process is not None:
+            ffmpeg_ok = await _terminate_ffmpeg(session.ffmpeg_process)
+            if not ffmpeg_ok:
+                raise WorkerFailure("video-recording-failed", "ffmpeg failed to finalize recording", status="partial")
+        if session.stderr_task is not None:
+            try:
+                await asyncio.wait_for(session.stderr_task, timeout=3)
+            except Exception:
+                pass
+
+    if target_path is None or not target_path.is_file() or target_path.stat().st_size == 0:
+        raise WorkerFailure("video-recording-failed", "Chrome recording stream is empty", status="partial")
+
+    return target_path.stat().st_size
 
 
 async def convert_and_validate_video(source: Path, destination: Path) -> dict[str, Any]:
@@ -1829,10 +1979,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
     browser_stderr_task: asyncio.Task[str] | None = None
     session: Any = None
     cdp: CDPSocket | None = None
-    ffmpeg_process: asyncio.subprocess.Process | None = None
-    ffmpeg_stderr_task: asyncio.Task[str] | None = None
-    frame_task: asyncio.Task[int] | None = None
-    stop_frames = asyncio.Event()
+    native_recorder: Any = None
     cleanup_ok = True
     partial_reason: tuple[str, str] | None = None
     final_url = request["url"]
@@ -1951,8 +2098,8 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
             )
             await _configure_page(page, cdp, request)
             await cdp.command("Page.addScriptToEvaluateOnNewDocument", {"source": JANK_INIT_SCRIPT})
-            ffmpeg_process, ffmpeg_stderr_task = await start_ffmpeg_recorder(source_video)
-            frame_task = asyncio.create_task(_capture_frames(cdp, ffmpeg_process, stop_frames))
+            native_recorder = await start_native_recording(cdp, request["width"], request["height"], source_video)
+            runtime["recordingBackend"] = "chrome-screencast"
             _validate_approved_domain(request["url"], domain["hostname"], stage="capture navigation")
             await asyncio.wait_for(page.goto(request["url"]), timeout=60)
             final_url = await _wait_for_approved_navigation(
@@ -2066,34 +2213,20 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
         partial_reason = ("capture-worker-failed", _redact_text(error))
         _log(f"capture worker failed: {type(error).__name__}: {error}")
     finally:
-        stop_frames.set()
-        if frame_task:
-            try:
-                await asyncio.wait_for(frame_task, timeout=12)
-            except Exception as error:
-                partial_reason = partial_reason or ("video-recording-failed", _redact_text(error))
-                if not frame_task.done():
-                    frame_task.cancel()
-                    await asyncio.gather(frame_task, return_exceptions=True)
         if cdp:
-            runtime["screenshotRetryCount"] = cdp.screenshot_retry_count
+            if native_recorder:
+                try:
+                    runtime["nativeRecordingBytes"] = await asyncio.wait_for(
+                        stop_native_recording(cdp, native_recorder, source_video), timeout=60
+                    )
+                    video_info = await convert_and_validate_video(source_video, webm_path)
+                except Exception as error:
+                    partial_reason = partial_reason or ("video-recording-failed", _redact_text(error))
+                    _log(f"Native recording finalization failed: {type(error).__name__}: {error}")
             await _stop_request_guard(cdp, request_guard_task)
             request_guard_task = None
             await cdp.close()
         cleanup_ok = await cleanup_browser_lifecycle(session, browser) and cleanup_ok
-        if ffmpeg_process:
-            ffmpeg_ok = await _terminate_ffmpeg(ffmpeg_process)
-            cleanup_ok = cleanup_ok and ffmpeg_ok
-            if ffmpeg_ok:
-                try:
-                    video_info = await convert_and_validate_video(source_video, webm_path)
-                except WorkerFailure as error:
-                    partial_reason = partial_reason or (error.reason_code, str(error))
-        if ffmpeg_stderr_task:
-            try:
-                await asyncio.wait_for(ffmpeg_stderr_task, timeout=3)
-            except Exception:
-                cleanup_ok = False
         if browser_stderr_task:
             try:
                 await asyncio.wait_for(browser_stderr_task, timeout=3)
