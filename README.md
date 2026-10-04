@@ -5,6 +5,21 @@ This local stdio MCP server exposes `check_capture_gpu` and
 connects to a rented Linux GPU runner over its current Vast SSH endpoint;
 Browser Use and Chrome run on that runner.
 
+Chrome records video through the Chrome DevTools Protocol screencast API
+(`Page.startScreencast` / `Page.stopScreencast`). As the browser renders updates,
+frames arrive event-driven via `Page.screencastFrame`, are acknowledged with
+`Page.screencastFrameAck`, and are streamed into an FFmpeg frame pump targeting 30
+frames per second. FFmpeg converts the intermediate capture into high-quality
+WebM (VP9); the recorder does not poll discrete screenshots or drop idle pauses.
+The compatibility probe tests this same screencast recording path.
+
+Screencast recording captures at 30 frames per second. Set `smooth_scroll=true` to
+use one continuous Chrome scroll gesture (`Input.synthesizeScrollGesture`) at
+`scroll_speed` pixels per second (default 500, range 100–2000). This mode ignores
+step and pause settings, records observed scroll positions, and checks consent
+during the gesture. It fails without a wheel-event fallback when the gesture cannot
+complete.
+
 Both tools accept `dry_run` (default `false`). With `dry_run=true`,
 `check_capture_gpu` lists its planned checks without contacting the runner.
 `capture_site_motion` validates the inputs and local artifact targets, then
