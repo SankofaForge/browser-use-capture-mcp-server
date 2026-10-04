@@ -100,6 +100,3 @@ failure mode. Performance acceptance compares three cold and five warm
 four-cell runs against the existing baseline, with each cell within its
 current timeout and p95 duration and peak memory no more than 20% worse.
 Until those results are recorded, do not claim complete capture evidence.
-
-The legacy `site-motion-capture` backend remains an explicit manual rollback
-during acceptance. It is not an automatic fallback.
