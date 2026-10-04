@@ -98,6 +98,39 @@ def make_request(tmp_path: Path, **overrides):
     return worker.validate_request(payload, runs_root=runs_root)
 
 
+@pytest.mark.parametrize("failure", [None, TimeoutError("wheel timed out"), AttributeError("wheel failed")])
+def test_scroll_awaits_actor_mouse_and_preserves_failure_kind(tmp_path, capsys, failure):
+    class Page:
+        position = 0
+
+        @property
+        async def mouse(self):
+            return self
+
+        async def scroll(self, *, x, y, delta_y):
+            if failure is not None:
+                raise failure
+            self.position += delta_y
+
+        async def evaluate(self, expression):
+            if "distance:doc" in expression:
+                return json.dumps({"distance": 1000, "fallback": False})
+            return str(self.position)
+
+        async def get_url(self):
+            return "https://example.com/landing"
+
+    request = make_request(tmp_path, scroll_distance=400, scroll_step=200, scroll_pause_ms=0)
+    evidence, _ = asyncio.run(worker._scroll_page(Page(), request, "example.com"))
+
+    assert evidence["completed"] is (failure is None)
+    assert evidence["actualDistance"] == (400 if failure is None else 0)
+    assert evidence["truncated"] is (failure is not None)
+    assert evidence["timedOut"] is isinstance(failure, TimeoutError)
+    if failure is not None:
+        assert type(failure).__name__ in capsys.readouterr().err
+
+
 def _records_for_address(address: str):
     def resolve(host: str, port: int, type: int):
         return [

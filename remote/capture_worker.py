@@ -1632,8 +1632,9 @@ async def _scroll_page(
             before = await page.evaluate(
                 "() => Math.max(window.scrollY,document.documentElement.scrollTop,document.body&&document.body.scrollTop||0)"
             )
+            mouse = await page.mouse
             await asyncio.wait_for(
-                page.mouse.scroll(
+                mouse.scroll(
                     x=request["width"] // 2, y=request["height"] // 2,
                     delta_y=min(request["scroll_step"], distance - evidence["actualDistance"]),
                 ),
@@ -1652,10 +1653,15 @@ async def _scroll_page(
                 _validate_approved_domain(await page.get_url(), approved_hostname, stage="scroll consent handling")
         except WorkerFailure:
             raise
-        except Exception:
+        except asyncio.TimeoutError as error:
             evidence["timedOut"] = True
+            _log(f"Scroll failed: {type(error).__name__}: {error}")
             break
-    evidence["truncated"] = evidence["timedOut"] or evidence["actualDistance"] + request["scroll_step"] < distance
+        except Exception as error:
+            evidence["truncated"] = True
+            _log(f"Scroll failed: {type(error).__name__}: {error}")
+            break
+    evidence["truncated"] = evidence["truncated"] or evidence["timedOut"] or evidence["actualDistance"] + request["scroll_step"] < distance
     evidence["completed"] = not evidence["truncated"]
     return evidence, consent_checks
 
