@@ -131,6 +131,51 @@ def test_scroll_awaits_actor_mouse_and_preserves_failure_kind(tmp_path, capsys, 
         assert type(failure).__name__ in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("mobile", [False, True])
+@pytest.mark.parametrize("outcome", ["complete", "short", "timeout", "unsupported"])
+def test_smooth_scroll_measures_one_gesture_without_wheel_fallback(tmp_path, mobile, outcome):
+    class Page:
+        position = 0
+
+        async def evaluate(self, expression):
+            if "distance:doc" in expression:
+                return json.dumps({"distance": 1000, "fallback": False})
+            return str(self.position)
+
+        async def get_url(self):
+            return "https://example.com/landing"
+
+        @property
+        async def mouse(self):
+            raise AssertionError("Smooth mode must not fall back to mouse wheel events")
+
+    page = Page()
+    commands = []
+
+    class CDP:
+        async def command(self, method, params, *, timeout):
+            commands.append((method, params, timeout))
+            if outcome == "timeout":
+                raise TimeoutError("gesture timed out")
+            if outcome == "unsupported":
+                raise RuntimeError("gesture unsupported")
+            page.position = 400 if outcome == "complete" else 200
+            return {}
+
+    request = make_request(tmp_path, smooth_scroll=True, scroll_speed=500, scroll_distance=400, mobile=mobile)
+    evidence, _ = asyncio.run(worker._scroll_page(page, request, "example.com", cdp=CDP()))
+    assert len(commands) == 1
+    assert commands[0][0] == "Input.synthesizeScrollGesture"
+    assert commands[0][1]["yDistance"] == -400
+    assert commands[0][1]["speed"] == 500
+    assert commands[0][1]["preventFling"] is True
+    assert commands[0][1]["gestureSourceType"] == ("touch" if mobile else "mouse")
+    assert evidence["completed"] is (outcome == "complete")
+    assert evidence["timedOut"] is (outcome == "timeout")
+    assert evidence["actualDistance"] == page.position
+    assert evidence["truncated"] is (outcome != "complete")
+
+
 def _records_for_address(address: str):
     def resolve(host: str, port: int, type: int):
         return [

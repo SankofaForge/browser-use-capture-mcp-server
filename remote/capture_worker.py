@@ -281,7 +281,7 @@ def validate_request(payload: Any, *, runs_root: Path = RUNS_ROOT) -> dict[str, 
         "consent_save_selector", "consent_wait_ms", "consent_budget_ms",
         "consent_max_clicks", "consent_preflight", "settle_ms", "wait_fonts",
         "wait_idle", "idle_timeout_ms", "scroll", "scroll_distance",
-        "scroll_step", "scroll_pause_ms", "hover_selectors", "hover_selector",
+        "scroll_step", "scroll_pause_ms", "smooth_scroll", "scroll_speed", "hover_selectors", "hover_selector",
         "hover_wait_ms", "click_selectors", "click_selector", "click_wait_ms",
         "auto_discover", "auto_discover_max", "auto_discover_wait_ms",
         "tail_ms", "jank_check", "jank_threshold_ms", "timeout_ms",
@@ -345,6 +345,8 @@ def validate_request(payload: Any, *, runs_root: Path = RUNS_ROOT) -> dict[str, 
         "scroll_distance": scroll_distance,
         "scroll_step": _bounded_int(payload, "scroll_step", 100, 1, 4000),
         "scroll_pause_ms": _bounded_int(payload, "scroll_pause_ms", 60, 0, 10_000),
+        "smooth_scroll": _required_bool(payload, "smooth_scroll", False),
+        "scroll_speed": _bounded_int(payload, "scroll_speed", 500, 100, 2000),
         "hover_wait_ms": _bounded_int(payload, "hover_wait_ms", 800, 0, 30_000),
         "click_wait_ms": _bounded_int(payload, "click_wait_ms", 1200, 0, 30_000),
         "auto_discover": _required_bool(payload, "auto_discover", False),
@@ -1599,6 +1601,7 @@ async def _scroll_page(
     request: dict[str, Any],
     approved_hostname: str,
     consent_recheck: Callable[[], Any] | None = None,
+    cdp: CDPSocket | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     evidence: dict[str, Any] = {
         "requested": request["scroll"], "completed": not request["scroll"],
@@ -1625,6 +1628,51 @@ async def _scroll_page(
     evidence["requestedDistance"] = distance
     if distance == 0:
         evidence["completed"] = True
+        return evidence, consent_checks
+    if request["smooth_scroll"]:
+        if cdp is None:
+            raise WorkerFailure("smooth-scroll-unavailable", "Smooth scrolling requires the target CDP connection")
+        evidence.update(backend="chrome-scroll-gesture", speedPixelsPerSecond=request["scroll_speed"], samples=[])
+        position_script = "() => Math.max(window.scrollY,document.documentElement.scrollTop,document.body&&document.body.scrollTop||0)"
+        before = float(await page.evaluate(position_script))
+        started = asyncio.get_running_loop().time()
+        gesture = asyncio.create_task(cdp.command("Input.synthesizeScrollGesture", {
+            "x": request["width"] // 2, "y": request["height"] // 2,
+            "yDistance": -distance, "speed": request["scroll_speed"],
+            "preventFling": True, "gestureSourceType": "touch" if request["mobile"] else "mouse",
+        }, timeout=min(request["timeout_ms"] / 1000, distance / request["scroll_speed"] + 10)))
+        last_consent_check = started
+        try:
+            while not gesture.done():
+                await asyncio.sleep(0.25)
+                now = asyncio.get_running_loop().time()
+                position = float(await page.evaluate(position_script))
+                evidence["samples"].append({"elapsedMs": round((now - started) * 1000), "position": position})
+                _validate_approved_domain(await page.get_url(), approved_hostname, stage="smooth scroll")
+                if consent_recheck and now - last_consent_check >= 1:
+                    consent_checks.append(await consent_recheck())
+                    last_consent_check = now
+            await gesture
+            if consent_recheck:
+                consent_checks.append(await consent_recheck())
+            _validate_approved_domain(await page.get_url(), approved_hostname, stage="smooth scroll completion")
+        except WorkerFailure:
+            raise
+        except asyncio.TimeoutError as error:
+            evidence["timedOut"] = True
+            _log(f"Smooth scroll failed: {type(error).__name__}: {error}")
+        except Exception as error:
+            evidence["truncated"] = True
+            _log(f"Smooth scroll failed: {type(error).__name__}: {error}")
+        finally:
+            if not gesture.done():
+                gesture.cancel()
+            await asyncio.gather(gesture, return_exceptions=True)
+        evidence["durationMs"] = round((asyncio.get_running_loop().time() - started) * 1000)
+        evidence["actualDistance"] = max(0, float(await page.evaluate(position_script)) - before)
+        evidence["completedDistance"] = evidence["actualDistance"]
+        evidence["truncated"] = evidence["truncated"] or evidence["timedOut"] or evidence["actualDistance"] + 2 < distance
+        evidence["completed"] = not evidence["truncated"]
         return evidence, consent_checks
     steps = max(1, (distance + request["scroll_step"] - 1) // request["scroll_step"])
     for _ in range(steps):
@@ -1972,7 +2020,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
                 )
 
             scroll_evidence, scroll_consent_checks = await _scroll_page(
-                page, request, domain["hostname"], recheck_consent_after_scroll
+                page, request, domain["hostname"], recheck_consent_after_scroll, cdp
             )
             consent_history.extend(scroll_consent_checks)
             await _mark_phase(page, phases, "scroll")
