@@ -25,7 +25,7 @@ from browser_use_capture_mcp.vast_runner import VastRunner, VastRunnerError
 
 CONTRACT_VERSION = "capture-cell.v2"
 SERVER_VERSION = "0.2.0"
-DEFAULT_OUTPUT = Path("artifacts/design-inspiration/site-motion-capture")
+DEFAULT_OUTPUT = Path("artifacts/design-inspiration/capture-evidence")
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 CAPABILITY_TTL_SECONDS = 120
 CAPTURE_BRIDGE_MARGIN_SECONDS = 750
@@ -143,12 +143,12 @@ def _selector(value: Any, field: str) -> str | None:
 def _output_directory(value: Any) -> Path:
     if value is not None and not isinstance(value, str):
         raise ValueError("output_dir must be a path string")
-    output_dir = Path(value or os.environ.get("SITE_MOTION_OUTPUT_DIR", DEFAULT_OUTPUT)).expanduser()
+    output_dir = Path(value or os.environ.get("BROWSER_USE_CAPTURE_OUTPUT_DIR", DEFAULT_OUTPUT)).expanduser()
     if not output_dir.is_absolute():
         output_dir = Path.cwd() / output_dir
     output_dir = output_dir.resolve()
     approved_roots = [
-        Path(os.environ.get("SITE_MOTION_APPROVED_OUTPUT_ROOT", Path.cwd())).expanduser().resolve(),
+        Path(os.environ.get("BROWSER_USE_CAPTURE_APPROVED_OUTPUT_ROOT", Path.cwd())).expanduser().resolve(),
         Path(tempfile.gettempdir()).resolve(),
     ]
     if not any(output_dir == root or root in output_dir.parents for root in approved_roots):

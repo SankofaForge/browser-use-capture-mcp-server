@@ -378,7 +378,7 @@ def test_vast_api_key_is_not_inherited_by_ssh_processes(monkeypatch):
 
 
 def test_configured_missing_ssh_identity_fails_closed(monkeypatch, tmp_path):
-    monkeypatch.setenv("SITE_MOTION_SSH_KEY", str(tmp_path / "missing-key"))
+    monkeypatch.setenv("BROWSER_USE_CAPTURE_SSH_KEY", str(tmp_path / "missing-key"))
     with pytest.raises(VastRunnerError, match="identity file is unavailable"):
         VastRunner()._ssh_options()
 

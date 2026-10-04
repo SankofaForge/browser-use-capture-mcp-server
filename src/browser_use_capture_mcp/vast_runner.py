@@ -68,7 +68,7 @@ class VastRunner:
         self.package_root = package_root or Path(__file__).resolve().parents[2]
         self.instance_id = os.environ.get("VAST_INSTANCE_ID", "")
         self.browser_path = os.environ.get("BROWSER_USE_CHROMIUM_PATH", "")
-        self.ssh_key = os.environ.get("SITE_MOTION_SSH_KEY")
+        self.ssh_key = os.environ.get("BROWSER_USE_CAPTURE_SSH_KEY")
 
     def validate_configuration(self) -> None:
         if not re.fullmatch(r"[0-9]{1,20}", self.instance_id):
