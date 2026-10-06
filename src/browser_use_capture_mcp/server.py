@@ -748,13 +748,6 @@ async def capture_site_motion(
         shutil.rmtree(stage_dir, ignore_errors=True)
 
 
-def cleanup_run_directory(run_directory: Path) -> str:
-    if not run_directory.exists():
-        return "missing"
-    shutil.rmtree(run_directory)
-    return "removed"
-
-
 def main() -> None:
     mcp.run(transport="stdio")
 

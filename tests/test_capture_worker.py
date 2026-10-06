@@ -16,29 +16,37 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "remote"))
 import capture_worker as worker
 
 
-def test_native_recording_uses_chrome_encoder_and_requested_viewport():
-    calls = []
+@pytest.fixture
+def mock_native_encoder(monkeypatch):
+    class Process:
+        returncode = 0
+        stdin = None
 
-    class CDP:
-        async def command(self, method, params=None, **kwargs):
-            calls.append((method, params))
-            return {}
+        async def wait(self):
+            return 0
 
-    session = asyncio.run(worker.start_native_recording(CDP(), 1440, 1000))
+    async def empty_stderr():
+        return ""
 
-    assert isinstance(session, worker.ScreencastRecordingSession)
-    assert calls == [
-        ("Page.bringToFront", None),
-        ("Page.startScreencast", {"format": "jpeg", "quality": 80, "maxWidth": 1440, "maxHeight": 1000, "everyNthFrame": 1}),
-    ]
+    async def start_encoder(_path):
+        return Process(), asyncio.create_task(empty_stderr())
+
+    async def pump_frames(_session):
+        return 0
+
+    monkeypatch.setattr(worker, "start_ffmpeg_recorder", start_encoder)
+    monkeypatch.setattr(worker.ScreencastRecordingSession, "pump_frames", pump_frames)
 
 
-def test_native_recording_handles_screencast_frames_and_acks(tmp_path):
+def test_native_recording_handles_screencast_frames_and_acks(tmp_path, mock_native_encoder):
     calls = []
 
     class CDP:
         def __init__(self):
             self.screencast_handler = None
+
+        def set_screencast_handler(self, handler):
+            self.screencast_handler = handler
 
         async def command(self, method, params=None, **kwargs):
             calls.append((method, params))
@@ -49,7 +57,11 @@ def test_native_recording_handles_screencast_frames_and_acks(tmp_path):
 
     cdp = CDP()
     output = tmp_path / "native.mp4"
-    session = asyncio.run(worker.start_native_recording(cdp, 1280, 720))
+    session = asyncio.run(worker.start_native_recording(cdp, 1280, 720, output))
+    assert calls == [
+        ("Page.bringToFront", None),
+        ("Page.startScreencast", {"format": "jpeg", "quality": 80, "maxWidth": 1280, "maxHeight": 720, "everyNthFrame": 1}),
+    ]
     assert cdp.screencast_handler is not None
 
     frame_bytes = b"\xff\xd8\xff\xe0testjpeg"
@@ -65,15 +77,18 @@ def test_native_recording_handles_screencast_frames_and_acks(tmp_path):
     assert session.latest_frame == frame_bytes
 
     output.write_bytes(frame_bytes)
-    size = asyncio.run(worker.stop_native_recording(cdp, session, output))
+    size = asyncio.run(worker.stop_native_recording(cdp, session))
     assert size == len(frame_bytes)
     assert any(c[0] == "Page.stopScreencast" for c in calls)
 
 
-def test_native_recording_rejects_empty_output(tmp_path):
+def test_native_recording_rejects_empty_output(tmp_path, mock_native_encoder):
     calls = []
 
     class CDP:
+        def set_screencast_handler(self, handler):
+            self.screencast_handler = handler
+
         async def command(self, method, params=None, **kwargs):
             calls.append(method)
             return {}
@@ -82,16 +97,16 @@ def test_native_recording_rejects_empty_output(tmp_path):
     output.write_bytes(b"")
 
     cdp = CDP()
-    session = asyncio.run(worker.start_native_recording(cdp, 1280, 720))
+    session = asyncio.run(worker.start_native_recording(cdp, 1280, 720, output))
     with pytest.raises(worker.WorkerFailure) as raised:
-        asyncio.run(worker.stop_native_recording(cdp, session, output))
+        asyncio.run(worker.stop_native_recording(cdp, session))
 
     assert raised.value.reason_code == "video-recording-failed"
     assert raised.value.status == "partial"
     assert "Page.stopScreencast" in calls
 
 
-def test_native_recording_unavailable_does_not_fall_back_to_screenshots():
+def test_native_recording_unavailable_does_not_fall_back_to_screenshots(tmp_path):
     class CDP:
         async def command(self, method, params=None, **kwargs):
             if method == "Page.startScreencast":
@@ -100,14 +115,17 @@ def test_native_recording_unavailable_does_not_fall_back_to_screenshots():
             return {}
 
     with pytest.raises(worker.WorkerFailure, match="CDPError: Method not found") as raised:
-        asyncio.run(worker.start_native_recording(CDP(), 390, 844))
+        asyncio.run(worker.start_native_recording(CDP(), 390, 844, tmp_path / "native.mp4"))
     assert raised.value.reason_code == "native-recording-unavailable"
 
 
-def test_native_recording_cancellation_closes_stream(tmp_path):
+def test_native_recording_cancellation_detaches_handler(tmp_path, mock_native_encoder):
     calls = []
 
     class CDP:
+        def set_screencast_handler(self, handler):
+            self.screencast_handler = handler
+
         async def command(self, method, params=None, **kwargs):
             calls.append(method)
             if method == "Page.stopScreencast":
@@ -118,10 +136,11 @@ def test_native_recording_cancellation_closes_stream(tmp_path):
     output.write_bytes(b"video-data")
 
     cdp = CDP()
-    session = asyncio.run(worker.start_native_recording(cdp, 1280, 720))
+    session = asyncio.run(worker.start_native_recording(cdp, 1280, 720, output))
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(worker.stop_native_recording(cdp, session, output))
+        asyncio.run(worker.stop_native_recording(cdp, session))
     assert "Page.stopScreencast" in calls
+    assert cdp.screencast_handler is None
 
 
 def test_actor_page_target_does_not_require_agent_focus():
@@ -901,3 +920,185 @@ def test_missing_ffmpeg_is_a_structured_failure(monkeypatch, tmp_path: Path):
         asyncio.run(worker.convert_and_validate_video(tmp_path / "source.webm", tmp_path / "output.webm"))
 
     assert raised.value.reason_code == "media-tools-unavailable"
+
+
+@pytest.mark.parametrize("cancel_tool", ["ffmpeg", "ffprobe"])
+def test_media_conversion_cancellation_terminates_process_group(monkeypatch, tmp_path, cancel_tool):
+    source = tmp_path / "native.mp4"
+    destination = tmp_path / "capture.webm"
+    source.write_bytes(b"native-video")
+    destination.write_bytes(b"converted-video")
+    processes = []
+    signals = []
+
+    class Process:
+        stderr = None
+
+        def __init__(self, tool):
+            self.tool = tool
+            self.pid = 100 + len(processes)
+            self.returncode = None
+            self.reaped = False
+            self.waits = 0
+
+        async def wait(self):
+            self.waits += 1
+            if self.tool == cancel_tool == "ffmpeg" and self.waits == 1:
+                raise asyncio.CancelledError
+            self.reaped = True
+            self.returncode = 0
+            return 0
+
+        async def communicate(self):
+            assert self.tool == cancel_tool == "ffprobe"
+            raise asyncio.CancelledError
+
+    async def create_process(tool, *_args, **kwargs):
+        assert kwargs["start_new_session"] is True
+        process = Process(tool)
+        processes.append(process)
+        return process
+
+    async def drain_stderr(_stream):
+        return ""
+
+    monkeypatch.setattr(worker.shutil, "which", lambda name: name)
+    monkeypatch.setattr(worker.asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(worker, "_drain_stderr", drain_stderr)
+    monkeypatch.setattr(worker.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(worker.convert_and_validate_video(source, destination))
+
+    cancelled_process = processes[-1]
+    assert cancelled_process.tool == cancel_tool
+    assert cancelled_process.reaped
+    expected_signal = worker.signal.SIGKILL if cancel_tool == "ffmpeg" else worker.signal.SIGTERM
+    assert signals == [(cancelled_process.pid, expected_signal)]
+
+
+def test_consent_candidates_include_nested_open_shadow_roots():
+    class DOM:
+        async def getDocument(self, params, **kwargs):
+            assert params == {"depth": -1, "pierce": True}
+            return {"root": {"children": [{"shadowRoots": [
+                {"nodeId": 2, "shadowRootType": "open", "children": [{"shadowRoots": [
+                    {"nodeId": 3, "shadowRootType": "open"}
+                ]}]}
+            ]}]}}
+
+        async def querySelectorAll(self, params, **kwargs):
+            return {"nodeIds": [params["nodeId"] + 10]}
+
+        async def describeNode(self, params, **kwargs):
+            return {"node": {"backendNodeId": params["nodeId"] + 100}}
+
+    class Page:
+        _client = SimpleNamespace(send=SimpleNamespace(DOM=DOM()))
+
+        async def _ensure_session(self):
+            return "session"
+
+        async def get_elements_by_css_selector(self, selector):
+            return ["document-control"]
+
+        async def get_element(self, backend_node_id):
+            return backend_node_id
+
+    assert asyncio.run(worker._consent_elements(Page(), "button")) == ["document-control", 112, 113]
+
+
+def test_consent_closed_shadow_root_fails_closed():
+    class DOM:
+        async def getDocument(self, params, **kwargs):
+            return {"root": {"shadowRoots": [{"nodeId": 2, "shadowRootType": "closed"}]}}
+
+    class Page:
+        _client = SimpleNamespace(send=SimpleNamespace(DOM=DOM()))
+
+        async def _ensure_session(self):
+            return "session"
+
+        async def get_elements_by_css_selector(self, selector):
+            return []
+
+    with pytest.raises(worker.WorkerFailure, match="closed shadow root"):
+        asyncio.run(worker._consent_elements(Page(), "button"))
+
+
+def test_none_consent_mode_inspects_closed_roots_without_action_selectors(monkeypatch):
+    inspected = []
+
+    async def page_json(*args, **kwargs):
+        return {"visibleSurfaceCount": 0, "iframeCount": 0, "openShadowHostCount": 0}
+
+    async def elements(page, selector):
+        inspected.append(selector)
+        raise worker.WorkerFailure("consent-unverified", "closed shadow root", status="partial")
+
+    monkeypatch.setattr(worker, "_page_json", page_json)
+    monkeypatch.setattr(worker, "_consent_elements", elements)
+    with pytest.raises(worker.WorkerFailure, match="could not be inspected"):
+        asyncio.run(worker.handle_consent(object(), {"consent_mode": "none", "consent_selectors": []}, "test"))
+    assert inspected == [":not(*)"]
+
+
+@pytest.mark.parametrize("value", [False, "False", "false", "", "unknown", 1, None])
+def test_actor_false_and_unknown_boolean_values_fail_closed(value):
+    assert worker._actor_boolean(value) is False
+
+
+@pytest.mark.parametrize("value", [True, "True", "true"])
+def test_actor_true_boolean_values_are_verified(value):
+    assert worker._actor_boolean(value) is True
+
+
+def test_reject_waits_for_asynchronous_banner_dismissal_within_budget(monkeypatch):
+    scans = iter([
+        {"visibleSurfaceCount": 1, "iframeCount": 0, "openShadowHostCount": 0},
+        {"visibleSurfaceCount": 1, "iframeCount": 0, "openShadowHostCount": 0},
+        {"visibleSurfaceCount": 0, "iframeCount": 0, "openShadowHostCount": 0},
+    ])
+
+    async def inspect(*args):
+        return next(scans)
+
+    async def click(*args, **kwargs):
+        return True, "#reject", None
+
+    async def sleep(*args):
+        pass
+
+    monkeypatch.setattr(worker, "_inspect_consent", inspect)
+    monkeypatch.setattr(worker, "_click_first", click)
+    monkeypatch.setattr(worker.asyncio, "sleep", sleep)
+    result = asyncio.run(worker.handle_consent(object(), {
+        "consent_mode": "reject", "consent_wait_ms": 0,
+        "consent_budget_ms": 500, "consent_selectors": [],
+    }, "test"))
+    assert result["verified"] is True
+    assert result["dismissed"] is True
+    assert result["clicks"] == 1
+
+
+def test_reject_dismissal_wait_stops_at_consent_budget(monkeypatch):
+    inspections = []
+
+    async def inspect(*args):
+        inspections.append(True)
+        return {"visibleSurfaceCount": 1, "iframeCount": 0, "openShadowHostCount": 0}
+
+    async def click(*args, **kwargs):
+        return True, "#reject", None
+
+    monkeypatch.setattr(worker, "_inspect_consent", inspect)
+    monkeypatch.setattr(worker, "_click_first", click)
+    result = asyncio.run(worker.handle_consent(object(), {
+        "consent_mode": "reject", "consent_wait_ms": 0,
+        "consent_budget_ms": 100, "consent_selectors": [],
+    }, "test"))
+    assert result["verified"] is False
+    assert result["dismissed"] is False
+    assert result["clicks"] == 1
+    assert result["budgetMs"] >= 100
+    assert len(inspections) == 2

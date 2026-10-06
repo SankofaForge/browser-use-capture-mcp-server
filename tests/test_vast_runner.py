@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+import anyio
 import pytest
 
 import browser_use_capture_mcp.vast_runner as vast_runner
@@ -410,3 +411,79 @@ def test_chrome_singleton_socket_fits_linux_unix_socket_path_limit():
     run_id = "707df2a1-f11e-421c-b255-2b0181b13a27"
     socket_path = f"{REMOTE_RUNS}/{run_id}/tmp/.org.chromium.Chromium.XXXXXX/SingletonSocket"
     assert len(socket_path.encode()) < 108
+
+
+def test_mcp_level_cancellation_finishes_remote_cleanup(monkeypatch, tmp_path):
+    runner = VastRunner()
+    completed = []
+
+    async def connection():
+        return VastConnection("root", "8.8.8.8", 2222)
+
+    async def sync_project(_connection):
+        return None
+
+    async def run_remote(_connection, command, **_kwargs):
+        if "cat >" in command or "setsid bash" in command:
+            return b"", b""
+        if "kill -TERM" in command:
+            await anyio.sleep(0.01)
+            completed.append("terminated")
+            return b"", b""
+        if "rm -rf" in command:
+            await anyio.sleep(0.01)
+            completed.append("removed")
+            return b"", b""
+        scope.cancel()
+        await anyio.sleep_forever()
+
+    monkeypatch.setattr(runner, "connection", connection)
+    monkeypatch.setattr(runner, "sync_project", sync_project)
+    monkeypatch.setattr(runner, "_run_remote", run_remote)
+
+    async def cancel_capture():
+        nonlocal scope
+        with anyio.CancelScope() as scope:
+            await runner.capture({"name": "cancelled", "timeout_ms": 180000}, tmp_path)
+        assert scope.cancelled_caught
+        assert completed == ["terminated", "removed"]
+
+    scope = None
+    anyio.run(cancel_capture)
+
+
+def test_mcp_level_cancellation_reaps_local_ssh_process(monkeypatch):
+    runner = VastRunner()
+    signals = []
+
+    class Process:
+        returncode = None
+        pid = 123
+
+        async def communicate(self, input=None):
+            scope.cancel()
+            await anyio.sleep_forever()
+
+        async def wait(self):
+            await anyio.sleep(0.01)
+            self.returncode = -15
+            return self.returncode
+
+    process = Process()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(vast_runner.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+
+    async def cancel_command():
+        nonlocal scope
+        with anyio.CancelScope() as scope:
+            await runner._run_local(["ssh", "fixture"], timeout=1)
+        assert scope.cancelled_caught
+        assert process.returncode == -15
+        assert signals == [(123, vast_runner.signal.SIGTERM)]
+
+    scope = None
+    anyio.run(cancel_command)

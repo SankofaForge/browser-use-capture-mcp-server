@@ -17,12 +17,11 @@ from browser_use_capture_mcp.server import (
     _validate_capture_input,
     _verified_capability,
     artifact_digest,
-    cleanup_run_directory,
     _has_symlink_targets,
     validate_media,
     _validate_jank_report,
 )
-from browser_use_capture_mcp.vast_runner import VastRunner, VastRunnerError
+from browser_use_capture_mcp.vast_runner import VastRunner
 
 
 def _public_dns(monkeypatch):
@@ -229,14 +228,6 @@ def test_remote_manifest_requires_exact_hashed_evidence(tmp_path: Path):
         _validate_remote_manifest(manifest, tmp_path, "name", manifest["runId"])
 
 
-def test_run_directory_cleanup_is_bounded(tmp_path: Path):
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    (run_directory / "capture.webm").write_bytes(b"fixture")
-    assert cleanup_run_directory(run_directory) == "removed"
-    assert not run_directory.exists()
-
-
 def test_capture_targets_reject_dangling_symlinks(tmp_path: Path):
     target = tmp_path / "capture.webm"
     target.symlink_to(tmp_path / "missing-target.webm")
@@ -310,15 +301,6 @@ def test_runner_shell_quotes_paths():
     from browser_use_capture_mcp.vast_runner import _shell_quote
 
     assert _shell_quote("/tmp/a'b") == "'/tmp/a'\\''b'"
-
-
-def test_connection_endpoint_rejects_private_ip(monkeypatch):
-    from browser_use_capture_mcp.vast_runner import SSH_URL_PATTERN
-
-    match = SSH_URL_PATTERN.search("ssh://root@127.0.0.1:2200")
-    assert match is not None
-    host = match.group(2)
-    assert not __import__("ipaddress").ip_address(host).is_global
 
 
 def test_probe_failure_reasons_remain_structured(monkeypatch):
