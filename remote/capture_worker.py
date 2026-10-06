@@ -51,18 +51,12 @@ SENSITIVE_QUERY_KEYS = re.compile(
     r"^(?:access_token|api_key|auth|authorization|cookie|key|password|secret|session|signature|token)$",
     re.IGNORECASE,
 )
-CONSENT_TEXT_PATTERN = re.compile(r"cookie|consent|privacy|tracking|personal data", re.I)
 REJECT_TEXT_PATTERN = re.compile(
     r"reject all|decline all|deny all|necessary only|only necessary|use necessary cookies only|"
     r"continue without accepting|refuse all|no thanks|reject|decline|deny",
     re.I,
 )
 ACCEPT_TEXT_PATTERN = re.compile(r"accept all|allow all|allow cookies|i agree|accept|allow|agree", re.I)
-CONSENT_SCOPE_SELECTOR = (
-    "[role='dialog'],[aria-modal='true'],#onetrust-banner-sdk,"
-    "#CybotCookiebotDialog,#didomi-host,[id*='cookie' i],[class*='cookie' i],"
-    "[id*='consent' i],[class*='consent' i],[data-testid*='consent' i]"
-)
 DEFAULT_CONSENT_SELECTORS = {
     "reject": (
         "#onetrust-reject-all",
@@ -113,7 +107,7 @@ CONSENT_SCAN_SCRIPT = r"""
   const known = "[role='dialog'],[aria-modal='true'],#onetrust-banner-sdk," +
     "#CybotCookiebotDialog,#didomi-host";
   const generic = "[id*='cookie' i],[class*='cookie' i],[id*='consent' i]," +
-    "[class*='consent' i],[data-testid*='consent' i]";
+    "[class*='consent' i],[data-testid*='consent' i],.cc-cmp-banner";
   const visible = (element) => {
     const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
@@ -121,22 +115,29 @@ CONSENT_SCAN_SCRIPT = r"""
       Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
   };
   let visibleSurfaceCount = 0;
-  for (const element of document.querySelectorAll(known + "," + generic)) {
-    if (!visible(element)) continue;
-    if (element.matches(known) ||
-        relevant.test((element.innerText || "") + " " +
+  let iframeCount = 0;
+  let openShadowHostCount = 0;
+  const inspect = (root) => {
+    iframeCount += root.querySelectorAll("iframe").length;
+    for (const element of root.querySelectorAll(known + "," + generic)) {
+      if (!visible(element)) continue;
+      if (element.matches(known) || relevant.test(
+          (element.innerText || "") + " " +
           (element.getAttribute("aria-label") || "") + " " +
           (element.getAttribute("aria-describedby") || ""))) {
-      visibleSurfaceCount += 1;
+        visibleSurfaceCount += 1;
+      }
     }
-  }
-  let openShadowHostCount = 0;
-  for (const element of document.querySelectorAll("*")) {
-    if (element.shadowRoot) openShadowHostCount += 1;
-  }
+    for (const element of root.querySelectorAll("*")) {
+      if (!element.shadowRoot) continue;
+      try { inspect(element.shadowRoot); }
+      catch (_) { openShadowHostCount += 1; }
+    }
+  };
+  inspect(document);
   return JSON.stringify({
     visibleSurfaceCount,
-    iframeCount: document.querySelectorAll("iframe").length,
+    iframeCount,
     openShadowHostCount
   });
 }
@@ -754,7 +755,10 @@ async def _browser_executable() -> tuple[Path, str]:
         raise WorkerFailure("browser-executable-snap-shim", "Configured Chrome path is a Snap shim")
     if re.search(r"(?:^|\s)(?:wrapper|launcher)(?:\s|$)", output, re.I):
         raise WorkerFailure("browser-executable-wrapper", "Configured Chrome path is a wrapper")
-    return executable, _redact_text(output.splitlines()[0])
+    version_match = re.search(r"\d+(?:\.\d+){2,3}", output)
+    if not version_match:
+        raise WorkerFailure("browser-executable-invalid", "Configured Chrome version string is not recognized")
+    return executable, version_match.group(0)
 
 
 def _chromium_sandbox_enabled() -> bool:
@@ -971,8 +975,9 @@ async def start_ffmpeg_recorder(path: Path, fps: int = CAPTURE_FPS) -> tuple[asy
         ffmpeg,
         "-hide_banner", "-loglevel", "error", "-y",
         "-f", "image2pipe", "-vcodec", "mjpeg", "-framerate", str(fps), "-i", "pipe:0",
-        "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart", str(path),
+        "-an", "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "5", "-threads", "2",
+        "-lag-in-frames", "0", "-b:v", "0", "-crf", "34", "-pix_fmt", "yuv420p",
+        "-f", "webm", str(path),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
@@ -986,10 +991,10 @@ class ScreencastRecordingSession:
 
     def __init__(
         self,
-        cdp: Any,
-        ffmpeg_process: asyncio.subprocess.Process | None = None,
-        stderr_task: asyncio.Task[str] | None = None,
-        output_path: Path | None = None,
+        cdp: CDPSocket,
+        ffmpeg_process: asyncio.subprocess.Process,
+        stderr_task: asyncio.Task[str],
+        output_path: Path,
         fps: int = CAPTURE_FPS,
     ) -> None:
         self.cdp = cdp
@@ -1014,10 +1019,7 @@ class ScreencastRecordingSession:
                 _log(f"Invalid screencast frame data: {error}")
         if session_id is not None:
             try:
-                if hasattr(self.cdp, "ack_screencast_frame"):
-                    await self.cdp.ack_screencast_frame(session_id)
-                elif hasattr(self.cdp, "command"):
-                    await self.cdp.command("Page.screencastFrameAck", {"sessionId": session_id}, timeout=5)
+                await self.cdp.ack_screencast_frame(session_id)
             except Exception as error:
                 _log(f"screencastFrameAck failed: {error}")
 
@@ -1068,10 +1070,10 @@ class ScreencastRecordingSession:
 
 
 async def start_native_recording(
-    cdp: Any,
+    cdp: CDPSocket,
     width: int,
     height: int,
-    output_path: Path | None = None,
+    output_path: Path,
 ) -> ScreencastRecordingSession:
     try:
         await cdp.command("Page.bringToFront")
@@ -1085,10 +1087,7 @@ async def start_native_recording(
             f"Chrome native recording could not start: {type(error).__name__}: {_redact_text(error)}",
         ) from error
 
-    ffmpeg_process = None
-    stderr_task = None
-    if output_path is not None:
-        ffmpeg_process, stderr_task = await start_ffmpeg_recorder(output_path)
+    ffmpeg_process, stderr_task = await start_ffmpeg_recorder(output_path)
 
     session = ScreencastRecordingSession(
         cdp=cdp,
@@ -1101,65 +1100,44 @@ async def start_native_recording(
     def on_frame_sync(params: dict[str, Any]) -> None:
         asyncio.create_task(session.handle_frame(params))
 
-    if hasattr(cdp, "set_screencast_handler"):
-        cdp.set_screencast_handler(on_frame_sync)
-    elif hasattr(cdp, "screencast_handler"):
-        cdp.screencast_handler = on_frame_sync
-
-    if ffmpeg_process is not None:
-        session.pump_task = asyncio.create_task(session.pump_frames())
+    cdp.set_screencast_handler(on_frame_sync)
+    session.pump_task = asyncio.create_task(session.pump_frames())
 
     return session
 
 
-async def stop_native_recording(
-    cdp: Any,
-    session: Any,
-    path: Path | None = None,
-) -> int:
-    target_path = path or getattr(session, "output_path", None)
-    if isinstance(session, ScreencastRecordingSession):
-        session.stop_event.set()
-
+async def stop_native_recording(cdp: CDPSocket, session: ScreencastRecordingSession) -> int:
+    session.stop_event.set()
     try:
-        if hasattr(cdp, "command"):
-            await cdp.command("Page.stopScreencast", timeout=15)
+        await cdp.command("Page.stopScreencast", timeout=15)
     except asyncio.CancelledError:
         raise
     except Exception as error:
         _log(f"Page.stopScreencast failed: {error}")
     finally:
-        if hasattr(cdp, "set_screencast_handler"):
-            cdp.set_screencast_handler(None)
-        elif hasattr(cdp, "screencast_handler"):
-            cdp.screencast_handler = None
+        cdp.set_screencast_handler(None)
 
-    if isinstance(session, ScreencastRecordingSession):
-        if session.pump_task is not None:
-            try:
-                await asyncio.wait_for(session.pump_task, timeout=12)
-            except Exception as error:
-                if not session.pump_task.done():
-                    session.pump_task.cancel()
-                    await asyncio.gather(session.pump_task, return_exceptions=True)
-                raise WorkerFailure(
-                    "video-recording-failed",
-                    f"Frame pump failed: {type(error).__name__}: {_redact_text(error)}",
-                    status="partial",
-                ) from error
-        if session.ffmpeg_process is not None:
-            ffmpeg_ok = await _terminate_ffmpeg(session.ffmpeg_process)
-            if not ffmpeg_ok:
-                raise WorkerFailure("video-recording-failed", "ffmpeg failed to finalize recording", status="partial")
-        if session.stderr_task is not None:
-            try:
-                await asyncio.wait_for(session.stderr_task, timeout=3)
-            except Exception:
-                pass
-
-    if target_path is None or not target_path.is_file() or target_path.stat().st_size == 0:
+    if session.pump_task is not None:
+        try:
+            await asyncio.wait_for(session.pump_task, timeout=12)
+        except Exception as error:
+            if not session.pump_task.done():
+                session.pump_task.cancel()
+                await asyncio.gather(session.pump_task, return_exceptions=True)
+            raise WorkerFailure(
+                "video-recording-failed",
+                f"Frame pump failed: {type(error).__name__}: {_redact_text(error)}",
+                status="partial",
+            ) from error
+    if not await _terminate_ffmpeg(session.ffmpeg_process):
+        raise WorkerFailure("video-recording-failed", "ffmpeg failed to finalize recording", status="partial")
+    try:
+        await asyncio.wait_for(session.stderr_task, timeout=3)
+    except Exception:
+        pass
+    target_path = session.output_path
+    if not target_path.is_file() or target_path.stat().st_size == 0:
         raise WorkerFailure("video-recording-failed", "Chrome recording stream is empty", status="partial")
-
     return target_path.stat().st_size
 
 
@@ -1183,18 +1161,29 @@ async def convert_and_validate_video(source: Path, destination: Path) -> dict[st
     stderr_task = asyncio.create_task(_drain_stderr(conversion.stderr))
     try:
         exit_code = await asyncio.wait_for(conversion.wait(), timeout=120)
-    except asyncio.TimeoutError as error:
+    except (asyncio.TimeoutError, asyncio.CancelledError) as error:
         try:
             os.killpg(conversion.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         await conversion.wait()
+        if isinstance(error, asyncio.CancelledError):
+            raise
         raise WorkerFailure("webm-conversion-timeout", "WebM conversion timed out", status="partial") from error
     stderr = await stderr_task
     if exit_code != 0:
         raise WorkerFailure("webm-conversion-failed", f"ffmpeg could not convert the capture: {stderr}", status="partial")
     if not destination.is_file() or destination.stat().st_size == 0:
         raise WorkerFailure("webm-validation-failed", "Converted WebM is missing or empty", status="partial")
+    return await validate_webm(destination)
+
+
+async def validate_webm(destination: Path) -> dict[str, Any]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise WorkerFailure("media-tools-unavailable", "ffprobe is required for WebM evidence")
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise WorkerFailure("webm-validation-failed", "WebM is missing or empty", status="partial")
     result = await asyncio.create_subprocess_exec(
         ffprobe, "-v", "error", "-show_entries", "format=format_name,duration:stream=codec_type,width,height",
         "-of", "json", str(destination),
@@ -1205,7 +1194,7 @@ async def convert_and_validate_video(source: Path, destination: Path) -> dict[st
     )
     try:
         stdout, probe_stderr = await asyncio.wait_for(result.communicate(), timeout=15)
-    except asyncio.TimeoutError as error:
+    except (asyncio.TimeoutError, asyncio.CancelledError) as error:
         try:
             os.killpg(result.pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -1218,6 +1207,8 @@ async def convert_and_validate_video(source: Path, destination: Path) -> dict[st
             except ProcessLookupError:
                 pass
             await result.wait()
+        if isinstance(error, asyncio.CancelledError):
+            raise
         raise WorkerFailure("webm-validation-timeout", "ffprobe timed out while validating the WebM", status="partial") from error
     if result.returncode != 0:
         raise WorkerFailure("webm-validation-failed", f"ffprobe rejected the WebM: {_redact_text(probe_stderr.decode(errors='replace'))}", status="partial")
@@ -1387,6 +1378,49 @@ async def _stop_request_guard(cdp: CDPSocket | None, task: asyncio.Task[None] | 
             pass
 
 
+async def _consent_elements(page: Any, selector: str) -> list[Any]:
+    elements = await page.get_elements_by_css_selector(selector)
+    if not hasattr(page, "_ensure_session"):
+        return elements
+    session_id = await page._ensure_session()
+    client = page._client.send.DOM
+    document = await client.getDocument({"depth": -1, "pierce": True}, session_id=session_id)
+    pending = [document["root"]]
+    while pending:
+        node = pending.pop()
+        pending.extend(node.get("children", []))
+        for shadow in node.get("shadowRoots", []):
+            if shadow.get("shadowRootType") == "user-agent":
+                continue
+            if shadow.get("shadowRootType") != "open":
+                raise WorkerFailure("consent-unverified", "A closed shadow root could not be inspected", status="partial")
+            pending.append(shadow)
+            matches = await client.querySelectorAll(
+                {"nodeId": shadow["nodeId"], "selector": selector}, session_id=session_id
+            )
+            for node_id in matches["nodeIds"]:
+                described = await client.describeNode({"nodeId": node_id}, session_id=session_id)
+                elements.append(await page.get_element(described["node"]["backendNodeId"]))
+    return elements
+
+
+CONSENT_SCOPE_SCRIPT = r"""
+() => {
+  const known = "[role='dialog'],[aria-modal='true'],#onetrust-banner-sdk,#CybotCookiebotDialog,#didomi-host";
+  const scope = known + ",[id*='cookie' i],[class*='cookie' i],[id*='consent' i],[class*='consent' i],[data-testid*='consent' i],.cc-cmp-banner";
+  let element = this;
+  while (element) {
+    if (element.matches(scope)) {
+      const text = (element.innerText || element.textContent || "") + " " + (element.getAttribute("aria-label") || "");
+      if (element.matches(known) || /cookie|consent|privacy|tracking|personal data/i.test(text)) return true;
+    }
+    element = element.parentElement || element.getRootNode().host;
+  }
+  return false;
+}
+"""
+
+
 async def _inspect_consent(page: Any, request: dict[str, Any]) -> dict[str, int]:
     result = await _page_json(page, CONSENT_SCAN_SCRIPT, label="consent scan")
     if not isinstance(result, dict):
@@ -1403,19 +1437,28 @@ async def _inspect_consent(page: Any, request: dict[str, Any]) -> dict[str, int]
         selectors.extend(request["consent_save_selectors"])
     elif request["consent_mode"] in DEFAULT_CONSENT_SELECTORS:
         selectors.extend(DEFAULT_CONSENT_SELECTORS[request["consent_mode"]])
-    for selector in selectors:
-        try:
-            elements = await page.get_elements_by_css_selector(selector)
-        except Exception as error:
-            raise WorkerFailure("consent-unverified", "A consent selector could not be inspected", status="partial") from error
-        if any([await _element_is_visible(element) for element in elements]):
+    try:
+        elements = await _consent_elements(page, ",".join(selectors) if selectors else ":not(*)")
+    except Exception as error:
+        raise WorkerFailure("consent-unverified", "A consent selector could not be inspected", status="partial") from error
+    for element in elements:
+        if not await _element_is_visible(element):
+            continue
+        if request["consent_selectors"] or request["consent_mode"] == "granular" or _actor_boolean(
+            await element.evaluate(CONSENT_SCOPE_SCRIPT)
+        ):
             scan["visibleSurfaceCount"] += 1
+            break
     return scan
+
+
+def _actor_boolean(value: Any) -> bool:
+    return value is True or (isinstance(value, str) and value.lower() == "true")
 
 
 async def _element_is_visible(element: Any) -> bool:
     try:
-        return bool(await element.evaluate(
+        return _actor_boolean(await element.evaluate(
             "() => { const s=getComputedStyle(this), r=this.getBoundingClientRect(); "
             "return s.display!=='none' && s.visibility!=='hidden' && Number(s.opacity||1)>0 && r.width>0 && r.height>0; }"
         ))
@@ -1427,7 +1470,7 @@ async def _find_selector_candidates(page: Any, selectors: list[str]) -> list[tup
     candidates: list[tuple[Any, str]] = []
     for selector in selectors:
         try:
-            for element in await page.get_elements_by_css_selector(selector):
+            for element in await _consent_elements(page, selector):
                 if await _element_is_visible(element):
                     candidates.append((element, selector))
         except Exception:
@@ -1438,7 +1481,7 @@ async def _find_selector_candidates(page: Any, selectors: list[str]) -> list[tup
 async def _generic_consent_buttons(page: Any, phrase: re.Pattern[str]) -> list[tuple[Any, str]]:
     candidates = []
     try:
-        buttons = await page.get_elements_by_css_selector(
+        buttons = await _consent_elements(page,
             "button,[role='button'],input[type='button'],input[type='submit']"
         )
     except Exception:
@@ -1446,24 +1489,16 @@ async def _generic_consent_buttons(page: Any, phrase: re.Pattern[str]) -> list[t
     for index, element in enumerate(buttons):
         try:
             info = await element.evaluate(
-                "() => { const root=this.closest(\"[role='dialog'],[aria-modal='true'],"
-                "#onetrust-banner-sdk,#CybotCookiebotDialog,#didomi-host,[id*='cookie' i],"
-                "[class*='cookie' i],[id*='consent' i],[class*='consent' i],"
-                "[data-testid*='consent' i]\"); "
-                "return JSON.stringify({label:(this.innerText||this.value||this.getAttribute('aria-label')||'').slice(0,300),"
-                "scoped:!!root,known:!!(root&&root.matches(\"[role='dialog'],[aria-modal='true'],"
-                "#onetrust-banner-sdk,#CybotCookiebotDialog,#didomi-host\")),"
-                "scopeText:root?((root.innerText||'')+' '+(root.getAttribute('aria-label')||'' )).slice(0,2000):''}); }"
+                "() => JSON.stringify({label:(this.innerText||this.value||this.getAttribute('aria-label')||'').slice(0,300)})"
             )
             info = _parse_json_value(info, "button metadata")
-            if not isinstance(info, dict) or not await _element_is_visible(element):
+            if not isinstance(info, dict) or not phrase.search(str(info.get("label", ""))):
                 continue
-            if not info.get("scoped"):
+            if not await _element_is_visible(element):
                 continue
-            if not info.get("known") and not CONSENT_TEXT_PATTERN.search(str(info.get("scopeText", ""))):
+            if not _actor_boolean(await element.evaluate(CONSENT_SCOPE_SCRIPT)):
                 continue
-            if phrase.search(str(info.get("label", ""))):
-                candidates.append((element, f"scoped-button-index={index}"))
+            candidates.append((element, f"scoped-button-index={index}"))
         except Exception:
             continue
     return candidates
@@ -1496,16 +1531,8 @@ async def _click_first(
                 continue
             if require_scope:
                 try:
-                    scoped = await element.evaluate(
-                        "() => { const root=this.closest(\"[role='dialog'],[aria-modal='true'],"
-                        "#onetrust-banner-sdk,#CybotCookiebotDialog,#didomi-host,[id*='cookie' i],"
-                        "[class*='cookie' i],[id*='consent' i],[class*='consent' i],"
-                        "[data-testid*='consent' i]\"); "
-                        "if(!root)return false; if(root.matches(\"[role='dialog'],[aria-modal='true'],"
-                        "#onetrust-banner-sdk,#CybotCookiebotDialog,#didomi-host\"))return true; "
-                        "return /cookie|consent|privacy|tracking|personal data/i.test(root.innerText||''); }"
-                    )
-                    if not scoped:
+                    scoped = await element.evaluate(CONSENT_SCOPE_SCRIPT)
+                    if not _actor_boolean(scoped):
                         continue
                 except Exception:
                     continue
@@ -1535,7 +1562,8 @@ async def handle_consent(page: Any, request: dict[str, Any], phase: str) -> dict
         return result
 
     started = time.monotonic()
-    await asyncio.sleep(min(request["consent_wait_ms"], request["consent_budget_ms"]) / 1000)
+    if phase in {"preflight", "recorded"}:
+        await asyncio.sleep(min(request["consent_wait_ms"], request["consent_budget_ms"]) / 1000)
     initial = await _inspect_consent(page, request)
     result["initialSurfaceCount"] = initial["visibleSurfaceCount"]
     if initial["iframeCount"]:
@@ -1625,6 +1653,14 @@ async def handle_consent(page: Any, request: dict[str, Any], phase: str) -> dict
                 result["outcome"] = "no-safe-action"
 
     remaining = await _inspect_consent(page, request)
+    while remaining["visibleSurfaceCount"] and result["actionTaken"] and not result["blindSpots"]:
+        if remaining["iframeCount"] or remaining["openShadowHostCount"]:
+            break
+        budget_remaining = request["consent_budget_ms"] - round((time.monotonic() - started) * 1000)
+        if budget_remaining <= 0:
+            break
+        await asyncio.sleep(min(0.1, budget_remaining / 1000))
+        remaining = await _inspect_consent(page, request)
     if remaining["iframeCount"] and not any(item.get("kind") == "iframe-consent-not-inspected" for item in result["blindSpots"]):
         result["blindSpots"].append({"kind": "iframe-consent-not-inspected", "count": remaining["iframeCount"]})
     if remaining["openShadowHostCount"] and not any(item.get("kind") == "open-shadow-consent-not-inspected" for item in result["blindSpots"]):
@@ -1864,7 +1900,7 @@ async def _scroll_page(
     return evidence, consent_checks
 
 
-async def _browser_runtime_versions(executable: Path) -> dict[str, str]:
+async def _browser_runtime_versions(browser_version: str) -> dict[str, str]:
     try:
         browser_use_version = importlib.metadata.version("browser-use")
     except importlib.metadata.PackageNotFoundError as error:
@@ -1874,15 +1910,6 @@ async def _browser_runtime_versions(executable: Path) -> dict[str, str]:
             "browser-use-version-mismatch",
             f"Browser Use {EXPECTED_BROWSER_USE_VERSION} is required; installed release is {browser_use_version}",
         )
-    try:
-        result = await asyncio.to_thread(
-            subprocess.run, [str(executable), "--version"],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise WorkerFailure("browser-executable-invalid", "Configured Chrome version check failed") from error
-    if result.returncode != 0:
-        raise WorkerFailure("browser-executable-invalid", "Configured Chrome version check failed")
     nvidia_smi = shutil.which("nvidia-smi")
     if not nvidia_smi:
         raise WorkerFailure("capture-gpu-unavailable", "nvidia-smi is unavailable on the capture runner")
@@ -1893,13 +1920,9 @@ async def _browser_runtime_versions(executable: Path) -> dict[str, str]:
     if driver.returncode != 0 or not driver.stdout.strip():
         raise WorkerFailure("capture-gpu-unavailable", "The capture runner GPU could not be verified")
     gpu_name, _, driver_version = driver.stdout.strip().partition(",")
-    browser_version_text = _redact_text(result.stdout.strip() or result.stderr.strip()).splitlines()[0]
-    version_match = re.search(r"\d+(?:\.\d+){2,3}", browser_version_text)
-    if not version_match:
-        raise WorkerFailure("browser-executable-invalid", "Configured Chrome version string is not recognized")
     return {
         "browserUseVersion": browser_use_version,
-        "browserVersion": version_match.group(0),
+        "browserVersion": browser_version,
         "gpuName": gpu_name.strip()[:100],
         "driverVersion": driver_version.strip()[:64],
     }
@@ -1951,11 +1974,11 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
     except WorkerFailure as error:
         return _worker_result(error.status, run_id, reason_code=error.reason_code, message=str(error))
     try:
-        executable, _ = await _browser_executable()
+        executable, browser_version = await _browser_executable()
     except WorkerFailure as error:
         return _worker_result(error.status, run_id, reason_code=error.reason_code, message=str(error))
     try:
-        runtime = await _browser_runtime_versions(executable)
+        runtime = await _browser_runtime_versions(browser_version)
     except WorkerFailure as error:
         return _worker_result(error.status, run_id, reason_code=error.reason_code, message=str(error))
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
@@ -1974,7 +1997,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
                 existing.unlink()
     temp_root = Path(tempfile.mkdtemp(prefix=f"bu-{run_id[:8]}-", dir="/tmp"))
     profile_dir = temp_root / "browser-use-user-data-dir-profile"
-    source_video = temp_root / "capture-source.mp4"
+    source_video = temp_root / "capture-source.webm"
     browser: asyncio.subprocess.Process | None = None
     browser_stderr_task: asyncio.Task[str] | None = None
     session: Any = None
@@ -2046,7 +2069,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
             await asyncio.wait_for(session.start(), timeout=30)
             page = await session.get_current_page()
             if page is None:
-                page = await session.new_page()
+                page = await session.new_page("data:text/html,")
 
             if request["consent_preflight"] and request["consent_mode"] != "none":
                 target_id = await _page_target_id(page)
@@ -2083,7 +2106,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
                 request_guard_task = None
                 await cdp.close()
                 cdp = None
-                page = await session.new_page()
+                page = await session.new_page("data:text/html,")
 
             target_id = await _page_target_id(page)
             cdp = await connect_target_cdp(cdp_port, target_id)
@@ -2217,9 +2240,10 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
             if native_recorder:
                 try:
                     runtime["nativeRecordingBytes"] = await asyncio.wait_for(
-                        stop_native_recording(cdp, native_recorder, source_video), timeout=60
+                        stop_native_recording(cdp, native_recorder), timeout=60
                     )
-                    video_info = await convert_and_validate_video(source_video, webm_path)
+                    shutil.move(str(source_video), str(webm_path))
+                    video_info = await validate_webm(webm_path)
                 except Exception as error:
                     partial_reason = partial_reason or ("video-recording-failed", _redact_text(error))
                     _log(f"Native recording finalization failed: {type(error).__name__}: {error}")

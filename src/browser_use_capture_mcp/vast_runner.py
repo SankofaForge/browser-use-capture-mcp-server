@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import anyio
 
 REMOTE_ROOT = "/workspace/browser-use-capture"
 REMOTE_APP = f"{REMOTE_ROOT}/app"
@@ -200,18 +201,19 @@ class VastRunner:
     async def _terminate_process(process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:
             return
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(process.wait(), timeout=3)
-        except asyncio.TimeoutError:
+        with anyio.CancelScope(shield=True):
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
-                pass
-            await process.wait()
+                return
+            try:
+                await asyncio.wait_for(process.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await process.wait()
 
     async def _run_local(
         self,
@@ -456,15 +458,6 @@ class VastRunner:
             payload["failureReason"] = "compatibility result omitted a Browser Use or browser version"
         return payload
 
-    async def _copy_remote_file(self, connection: VastConnection, remote_path: str, local_path: Path) -> None:
-        command = [
-            "scp", "-p", *self._ssh_options(),
-            "-P", str(connection.port),
-            f"{connection.user}@{connection.host}:{remote_path}",
-            str(local_path),
-        ]
-        await self._run_local(command, timeout=90, error_code="capture-artifact-transfer-failed")
-
     async def _copy_remote_files(self, connection: VastConnection, remote_paths: list[str], local_directory: Path) -> None:
         if not remote_paths or any(
             not re.fullmatch(r"/workspace/bu/[0-9a-f-]{36}/(?:artifacts/)?[A-Za-z0-9._-]{1,120}", path)
@@ -515,9 +508,6 @@ class VastRunner:
         remote_exit = f"{run_directory}/worker.exit"
         remote_pid = f"{run_directory}/worker.pid"
         artifact_directory = f"{run_directory}/artifacts"
-        remote_video = f"{artifact_directory}/{capture['name']}.webm"
-        remote_jank = f"{artifact_directory}/{capture['name']}.jank.json"
-        remote_manifest = f"{artifact_directory}/manifest.json"
         worker_input = self.build_worker_input(capture, run_id, run_directory)
         input_json = json.dumps(worker_input, separators=(",", ":")).encode()
         worker_command = (
@@ -618,28 +608,12 @@ class VastRunner:
                     return result
             result["localArtifacts"] = transferred
             return result
-        except asyncio.CancelledError:
-            termination = asyncio.create_task(self._terminate_remote_run(connection, run_directory))
-            try:
-                await asyncio.shield(termination)
-            except asyncio.CancelledError:
-                await termination
-            raise
         except BaseException:
-            termination = asyncio.create_task(self._terminate_remote_run(connection, run_directory))
-            try:
-                await asyncio.shield(termination)
-            except asyncio.CancelledError:
-                await termination
+            with anyio.CancelScope(shield=True):
+                await self._terminate_remote_run(connection, run_directory)
             raise
         finally:
-            removal = asyncio.create_task(self._remove_remote_run(connection, run_directory))
-            try:
-                removed = await asyncio.shield(removal)
-                if "result" in locals() and isinstance(result, dict):
-                    result["remoteCleanup"] = "confirmed" if removed else "pending"
-            except asyncio.CancelledError:
-                removed = await removal
-                if "result" in locals() and isinstance(result, dict):
-                    result["remoteCleanup"] = "confirmed" if removed else "pending"
-                raise
+            with anyio.CancelScope(shield=True):
+                removed = await self._remove_remote_run(connection, run_directory)
+            if "result" in locals() and isinstance(result, dict):
+                result["remoteCleanup"] = "confirmed" if removed else "pending"
