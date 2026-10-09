@@ -570,7 +570,6 @@ class VastRunner:
                 raise VastRunnerError("capture-worker-failed", "The remote capture worker failed", _safe_output(result.get("failureReason", "")))
             artifact_names = result.get("artifacts") if isinstance(result.get("artifacts"), dict) else {}
             allowed_names = {
-                "manifest": "manifest.json",
                 "webm": f"{capture['name']}.webm",
                 "jank": f"{capture['name']}.jank.json",
             }

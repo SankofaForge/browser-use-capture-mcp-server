@@ -202,30 +202,25 @@ def test_capability_is_bound_to_runner_and_expires(monkeypatch):
     assert _verified_capability(capability_id, VastRunner())["reasonCode"] == "gpu-check-expired"
 
 
-def test_remote_manifest_requires_exact_hashed_evidence(tmp_path: Path):
-    from browser_use_capture_mcp.server import _validate_remote_manifest
+def test_remote_artifacts_require_exact_hashes(tmp_path: Path):
+    from browser_use_capture_mcp.server import _validate_remote_artifacts
 
     video = tmp_path / "name.webm"
     jank = tmp_path / "name.jank.json"
     video.write_bytes(b"video")
     jank.write_bytes(b"report")
-    manifest = {
-        "contractVersion": "capture-cell.v2",
-        "runId": "aa44ec52-ae57-4c73-a574-e824ac649e37",
-        "files": [
-            {"path": path.name, "size": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-            for path in (video, jank)
-        ],
-    }
-    checked = _validate_remote_manifest(manifest, tmp_path, "name", manifest["runId"])
-    assert {entry["path"] for entry in checked} == {"name.webm", "name.jank.json"}
-    manifest["files"][0]["sha256"] = "0" * 64
+    records = [
+        {"path": path.name, "size": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        for path in (video, jank)
+    ]
+    _validate_remote_artifacts(records, tmp_path, "name")
+    records[0]["sha256"] = "0" * 64
     with pytest.raises(ValueError, match="hash or size"):
-        _validate_remote_manifest(manifest, tmp_path, "name", manifest["runId"])
-    manifest["files"][0]["sha256"] = hashlib.sha256(video.read_bytes()).hexdigest()
-    manifest["files"][0]["size"] += 1
+        _validate_remote_artifacts(records, tmp_path, "name")
+    records[0]["sha256"] = hashlib.sha256(video.read_bytes()).hexdigest()
+    records[0]["size"] += 1
     with pytest.raises(ValueError, match="hash or size"):
-        _validate_remote_manifest(manifest, tmp_path, "name", manifest["runId"])
+        _validate_remote_artifacts(records, tmp_path, "name")
 
 
 def test_capture_targets_reject_dangling_symlinks(tmp_path: Path):

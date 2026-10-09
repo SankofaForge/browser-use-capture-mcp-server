@@ -49,10 +49,12 @@ uv run --locked python scripts/verify_compatibility.py
 ```
 
 Captures run as a dedicated nonroot user. The adapter accepts HTTP(S) URLs,
-including local and private addresses, uses isolated profiles, and validates
-consent, recording, jank, artifact hashes, and cleanup. It does not create an
-egress attestation or require a proxy or network namespace. Chrome may make
-ordinary service requests during a capture.
+including local and private addresses, uses isolated profiles, and writes a
+WebM plus a jank report. It checks consent, recording, jank, artifact hashes,
+GPU support, and cleanup before reporting a complete capture. It does not
+write a separate capture manifest. It does not create an egress attestation or
+require a proxy or network namespace. Chrome may make ordinary service requests
+during a capture.
 
 For an explicitly authorized disposable runner, set
 `BROWSER_USE_DISABLE_SANDBOX=1` on the local adapter process. The bridge passes
@@ -72,8 +74,14 @@ its rental teardown process.
    reported failure before retrying.
 
 Missing browser, SSH or startup timeout, missing GPU, software WebGL renderer,
-recording or jank failure, consent uncertainty, domain violation, timeout,
-cleanup failure, or artifact mismatch remains `blocked` or `partial`.
+recording or jank failure, an unverified consent action, a visible consent
+banner after acceptance, domain violation, timeout, cleanup failure, or artifact
+mismatch remains `blocked` or `partial`.
+
+For approved `accept` captures, consent is verified when the worker records an
+accepted action and confirms that the consent banner is no longer visible.
+Cookie-store comparisons and site-specific consent receipts are not required.
+Other inspection blind spots remain in the report for context.
 
 ## Runtime
 
@@ -94,9 +102,10 @@ The dependency pin is not proof that the compatibility matrix has passed.
 Runner provisioning, a passing CPU probe, and a visible GPU each establish only
 their own checks. Full acceptance also requires consent and animated/WebGL
 fixtures across desktop/full, desktop/reduced, mobile/full, and mobile/reduced
-cells; distinct, non-empty, hash-valid WebM and jank artifacts; unchanged
-downstream schema validation; and verified cleanup after success and every
-failure mode. Performance acceptance compares three cold and five warm
-four-cell runs against the existing baseline, with each cell within its
-current timeout and p95 duration and peak memory no more than 20% worse.
+cells; distinct, non-empty, hash-valid WebM and jank artifacts; valid capture
+cells and analysis sources in `workflow-manifest.v2`; and verified cleanup
+after success and every failure mode. Performance acceptance compares three
+cold and five warm four-cell runs against the existing baseline, with each cell
+within its current timeout and p95 duration and peak memory no more than 20%
+worse.
 Until those results are recorded, do not claim complete capture evidence.
