@@ -23,7 +23,6 @@ from mcp.server.mcpserver import MCPServer
 from browser_use_capture_mcp.vast_runner import VastRunner, VastRunnerError
 
 
-CONTRACT_VERSION = "capture-cell.v2"
 SERVER_VERSION = "0.2.0"
 DEFAULT_OUTPUT = Path("artifacts/design-inspiration/capture-evidence")
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
@@ -98,7 +97,6 @@ def _redact_url(value: str) -> str:
 
 def _blocked(reason_code: str, message: str, *, diagnostic: str | None = None, **details: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "contractVersion": CONTRACT_VERSION,
         "status": "blocked",
         "reasonCode": reason_code,
         "message": _redact(message),
@@ -241,7 +239,6 @@ def _issue_capability_record(probe: dict[str, Any], runner: VastRunner) -> dict[
         "gpu": probe.get("gpu", {}).get("device"),
     }
     return {
-        "contractVersion": CONTRACT_VERSION,
         "status": "verified",
         "gpu": probe["gpu"],
         "cpu": probe["cpu"],
@@ -310,6 +307,14 @@ def validate_media(path: Path, ffprobe: str = "ffprobe") -> dict[str, Any]:
     return {"status": "valid", "format": format_data["format_name"], "durationSeconds": duration, "videoStreamCount": video_stream_count}
 
 
+def _consent_passed(consent: Any) -> bool:
+    if not isinstance(consent, dict):
+        return False
+    if consent.get("mode") == "accept":
+        return consent.get("action") == "accepted" and consent.get("bannerVisible") is False
+    return consent.get("verified") is True and not consent.get("blindSpots")
+
+
 def _validate_jank_report(report: Any) -> dict[str, Any]:
     if not isinstance(report, dict) or report.get("schemaVersion") != "jank-report.v1":
         raise ValueError("jank report schema validation failed")
@@ -344,7 +349,7 @@ def _validate_jank_report(report: Any) -> dict[str, Any]:
     if report.get("status") == "valid":
         consent = report.get("consent")
         scroll = report.get("scroll")
-        if not isinstance(consent, dict) or consent.get("verified") is not True or consent.get("blindSpots"):
+        if not _consent_passed(consent):
             raise ValueError("valid jank report has incomplete consent evidence")
         if (
             report.get("interactionFailures") != []
@@ -361,33 +366,29 @@ def _has_symlink_targets(targets: dict[str, Path]) -> bool:
     return any(path.is_symlink() for path in targets.values())
 
 
-def _validate_remote_manifest(manifest: Any, stage_dir: Path, name: str, run_id: str) -> list[dict[str, Any]]:
+def _validate_remote_artifacts(
+    records: Any, stage_dir: Path, name: str, *, require_all: bool = True
+) -> set[str]:
     expected_names = {f"{name}.webm", f"{name}.jank.json"}
-    if not isinstance(manifest, dict) or manifest.get("contractVersion") != CONTRACT_VERSION:
-        raise ValueError("capture-cell.v2 manifest validation failed")
-    if manifest.get("runId") != run_id or not isinstance(manifest.get("files"), list):
-        raise ValueError("capture manifest run ID or files are invalid")
-    if len(manifest["files"]) != len(expected_names):
-        raise ValueError("capture manifest does not contain exactly the expected evidence files")
-    verified: list[dict[str, Any]] = []
+    if not isinstance(records, list) or (require_all and len(records) != len(expected_names)):
+        raise ValueError("capture worker did not report the expected artifact hashes")
     seen: set[str] = set()
-    for entry in manifest["files"]:
+    for entry in records:
         if not isinstance(entry, dict):
-            raise ValueError("capture manifest file entry is invalid")
+            raise ValueError("capture artifact record is invalid")
         filename = entry.get("path")
         if not isinstance(filename, str) or filename not in expected_names or filename in seen:
-            raise ValueError("capture manifest contains an unexpected or duplicate artifact")
+            raise ValueError("capture worker reported an unexpected or duplicate artifact")
         path = stage_dir / filename
         if not path.is_file() or path.is_symlink():
             raise ValueError(f"capture artifact is missing: {filename}")
         digest = artifact_digest(path)
         if digest["size"] <= 0 or digest["size"] != entry.get("size") or digest["sha256"] != entry.get("sha256"):
             raise ValueError(f"capture artifact hash or size mismatch: {filename}")
-        verified.append({"path": filename, "size": digest["size"], "sha256": digest["sha256"]})
         seen.add(filename)
-    if seen != expected_names:
-        raise ValueError("capture manifest evidence files are incomplete")
-    return verified
+    if require_all and seen != expected_names:
+        raise ValueError("capture worker did not report both artifacts")
+    return seen
 
 
 async def _compatibility_result(runner: VastRunner) -> dict[str, Any]:
@@ -444,7 +445,6 @@ async def check_capture_gpu(dry_run: bool = False) -> dict[str, Any]:
         return _blocked("capture-input-invalid", str(error))
     if dry_run:
         return {
-            "contractVersion": CONTRACT_VERSION,
             "status": "dry_run",
             "dryRun": True,
             "reasonCode": "dry_run.runner_check_not_started",
@@ -515,14 +515,12 @@ async def capture_site_motion(
     targets = {
         "video": output_dir / f"{stem}.webm",
         "jank": output_dir / f"{stem}.jank.json",
-        "manifest": output_dir / f"{stem}.capture-cell.v2.json",
     }
     if dry_run:
         target_error = _capture_target_error(targets, capture["overwrite"])
         if target_error:
             return target_error
         return {
-            "contractVersion": CONTRACT_VERSION,
             "status": "dry_run",
             "dryRun": True,
             "reasonCode": "dry_run.capture_not_started",
@@ -570,15 +568,21 @@ async def capture_site_motion(
         if result.get("status") in {"blocked", "partial"}:
             partial_files = result.get("localArtifacts") if isinstance(result.get("localArtifacts"), dict) else {}
             partial_artifacts: dict[str, Any] = {}
-            partial_run_id = result.get("runId")
-            if not isinstance(partial_run_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", partial_run_id):
-                partial_run_id = uuid.uuid4().hex
             destinations = {
                 "webm": targets["video"],
                 "jank": targets["jank"],
-                "manifest": output_dir / f"{stem}.worker-manifest.{partial_run_id}.partial.json",
             }
-            safe_names = {"webm": f"{stem}.webm", "jank": f"{stem}.jank.json", "manifest": "manifest.json"}
+            safe_names = {"webm": f"{stem}.webm", "jank": f"{stem}.jank.json"}
+            transferred_names = set(partial_files.values())
+            partial_records = [
+                item for item in result.get("artifactRecords", [])
+                if isinstance(item, dict) and item.get("path") in transferred_names
+            ] if isinstance(result.get("artifactRecords"), list) else []
+            recorded_names = _validate_remote_artifacts(
+                partial_records, stage_dir, stem, require_all=False
+            )
+            if recorded_names != transferred_names:
+                raise ValueError("capture worker omitted a transferred artifact hash")
             for key, filename in safe_names.items():
                 source = stage_dir / filename
                 if partial_files.get(key) != filename or not source.is_file() or source.is_symlink() or source.stat().st_size <= 0:
@@ -590,7 +594,6 @@ async def capture_site_motion(
                 partial_artifacts[key] = artifact_digest(destination)
             if partial_artifacts or result.get("status") == "partial":
                 return {
-                    "contractVersion": CONTRACT_VERSION,
                     "status": "partial",
                     "runId": result.get("runId"),
                     "reasonCode": result.get("reasonCode", "capture-partial"),
@@ -611,18 +614,15 @@ async def capture_site_motion(
                 url=capture["url"],
                 consent=result.get("consent", {"mode": capture["consent_mode"], "verified": False}),
             )
-        remote_manifest_path = stage_dir / "manifest.json"
-        with remote_manifest_path.open(encoding="utf-8") as source:
-            remote_manifest = json.load(source)
-        run_id = result.get("runId") or remote_manifest.get("runId")
+        run_id = result.get("runId")
         if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", run_id):
             raise ValueError("remote capture returned an invalid run ID")
-        files = _validate_remote_manifest(remote_manifest, stage_dir, stem, run_id)
+        _validate_remote_artifacts(result.get("artifactRecords"), stage_dir, stem)
         video_path = stage_dir / f"{stem}.webm"
         jank_path = stage_dir / f"{stem}.jank.json"
         with jank_path.open(encoding="utf-8") as source:
             jank = _validate_jank_report(json.load(source))
-        worker_media = result.get("mediaValidation") or remote_manifest.get("validation", {}).get("media")
+        worker_media = result.get("mediaValidation")
         worker_duration = worker_media.get("durationSeconds") if isinstance(worker_media, dict) else None
         worker_media_valid = (
             isinstance(worker_media, dict)
@@ -658,40 +658,24 @@ async def capture_site_motion(
             "mobile": capture["mobile"],
             "reducedMotion": capture["reduced_motion"],
         }
-        reported_viewport = remote_manifest.get("viewport")
+        reported_viewport = remote_evidence.get("viewport")
         viewport_verified = isinstance(reported_viewport, dict) and all(
             reported_viewport.get(key) == value for key, value in expected_viewport.items()
         )
-        manifest = {
-            **remote_manifest,
-            "contractVersion": CONTRACT_VERSION,
-            "cellId": f"{'mobile' if capture['mobile'] else 'desktop'}-{'reduced' if capture['reduced_motion'] else 'full'}",
-            "url": _redact_url(capture["url"]),
-            "finalUrl": _redact_url(jank.get("finalUrl") or capture["url"]),
-            "viewport": reported_viewport if viewport_verified else expected_viewport,
-            "modes": {"gpu": capture["gpu"], "scroll": not capture["no_scroll"]},
-            "files": files,
-            "validation": {"media": worker_media, "jank": {"status": jank["status"]}},
-            "cleanup": cleanup_status,
-            "status": "complete" if (
-                result.get("status") == "complete"
-                and worker_media.get("status") == "valid"
-                and jank.get("status") == "valid"
-                and jank.get("consent", {}).get("verified") is True
-                and cleanup_status == "confirmed"
-                and gpu_verified
-                and viewport_verified
-            ) else "partial",
-            "evidence": {
-                "gpu": {"status": "verified" if gpu_verified else "blocked"},
-                "consent": jank.get("consent"),
-                "interactionFailures": jank.get("interactionFailures", []),
-                "scroll": jank.get("scroll"),
-            },
-        }
-        manifest["files"] = files
-        temporary_manifest = stage_dir / "capture-cell.v2.json"
-        temporary_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        capture_status = "complete" if (
+            result.get("status") == "complete"
+            and worker_media.get("status") == "valid"
+            and jank.get("status") == "valid"
+            and _consent_passed(jank.get("consent"))
+            and cleanup_status == "confirmed"
+            and gpu_verified
+            and viewport_verified
+        ) else "partial"
+        final_url = _redact_url(jank.get("finalUrl") or capture["url"])
+        cell_id = f"{'mobile' if capture['mobile'] else 'desktop'}-{'reduced' if capture['reduced_motion'] else 'full'}"
+        viewport = reported_viewport if viewport_verified else expected_viewport
+        modes = {"gpu": capture["gpu"], "scroll": not capture["no_scroll"]}
+        validation = {"media": worker_media, "jank": {"status": jank["status"]}}
         backups: dict[str, Path] = {}
         published: list[str] = []
         try:
@@ -700,11 +684,10 @@ async def capture_site_motion(
                     backup = stage_dir / f"previous-{target.name}"
                     shutil.copy2(target, backup)
                     backups[key] = backup
-            for key in ("video", "jank", "manifest"):
-                source = temporary_manifest if key == "manifest" else stage_dir / targets[key].name
+            for key in ("video", "jank"):
+                source = stage_dir / targets[key].name
                 os.replace(source, targets[key])
                 published.append(key)
-            manifest_digest = artifact_digest(targets["manifest"])
             video_digest = artifact_digest(targets["video"])
             jank_digest = artifact_digest(targets["jank"])
         except BaseException:
@@ -716,23 +699,22 @@ async def capture_site_motion(
                     targets[key].unlink(missing_ok=True)
             raise
         return {
-            "contractVersion": CONTRACT_VERSION,
-            "status": manifest["status"],
+            "status": capture_status,
             "runId": run_id,
             "url": _redact_url(capture["url"]),
-            "finalUrl": manifest["finalUrl"],
-            "cellId": manifest["cellId"],
-            "viewport": manifest["viewport"],
-            "modes": manifest["modes"],
+            "finalUrl": final_url,
+            "cellId": cell_id,
+            "viewport": viewport,
+            "width": capture["width"],
+            "height": capture["height"],
+            "modes": modes,
             "consent": jank.get("consent"),
-            "validation": manifest["validation"],
+            "validation": validation,
             "cleanup": cleanup_status,
             "artifacts": {
                 "video": {**video_digest},
                 "jank": {**jank_digest},
-                "manifest": {**manifest_digest},
             },
-            "manifestPath": str(targets["manifest"]),
         }
     except asyncio.CancelledError:
         raise

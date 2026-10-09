@@ -27,7 +27,6 @@ import time
 import uuid
 from collections import deque
 from contextlib import suppress
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -36,7 +35,6 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 RUNS_ROOT = Path("/workspace/bu")
 EXPECTED_BROWSER_USE_VERSION = "0.13.10"
-CONTRACT_VERSION = "capture-cell.v2"
 JANK_SCHEMA_VERSION = "jank-report.v1"
 LONG_TASK_THRESHOLD_MS = 50
 CAPTURE_FPS = 30
@@ -104,10 +102,10 @@ JANK_INIT_SCRIPT = r"""
 CONSENT_SCAN_SCRIPT = r"""
 () => {
   const relevant = /cookie|consent|privacy|tracking|personal data/i;
-  const known = "[role='dialog'],[aria-modal='true'],#onetrust-banner-sdk," +
-    "#CybotCookiebotDialog,#didomi-host";
+  const known = "#onetrust-banner-sdk,#CybotCookiebotDialog,#didomi-host";
   const generic = "[id*='cookie' i],[class*='cookie' i],[id*='consent' i]," +
     "[class*='consent' i],[data-testid*='consent' i],.cc-cmp-banner";
+  const dialog = "[role='dialog'],[aria-modal='true']";
   const visible = (element) => {
     const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
@@ -115,17 +113,25 @@ CONSENT_SCAN_SCRIPT = r"""
       Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
   };
   let visibleSurfaceCount = 0;
+  let bannerVisible = false;
   let iframeCount = 0;
   let openShadowHostCount = 0;
   const inspect = (root) => {
     iframeCount += root.querySelectorAll("iframe").length;
-    for (const element of root.querySelectorAll(known + "," + generic)) {
+    for (const element of root.querySelectorAll(known + "," + generic + "," + dialog)) {
       if (!visible(element)) continue;
-      if (element.matches(known) || relevant.test(
-          (element.innerText || "") + " " +
-          (element.getAttribute("aria-label") || "") + " " +
-          (element.getAttribute("aria-describedby") || ""))) {
+      const text = (element.innerText || "") + " " +
+        (element.getAttribute("aria-label") || "") + " " +
+        (element.getAttribute("aria-describedby") || "");
+      const namedSurface = element.matches(known + "," + generic);
+      const labeledDialog = element.matches(dialog) && relevant.test(text);
+      if (namedSurface || labeledDialog) {
         visibleSurfaceCount += 1;
+        if (
+          element.matches(known) ||
+          (element.matches(generic) && !element.matches("button,[role='button'],input,a")) ||
+          (element.matches(dialog) && /cookie|consent/i.test(text))
+        ) bannerVisible = true;
       }
     }
     for (const element of root.querySelectorAll("*")) {
@@ -137,6 +143,7 @@ CONSENT_SCAN_SCRIPT = r"""
   inspect(document);
   return JSON.stringify({
     visibleSurfaceCount,
+    bannerVisible,
     iframeCount,
     openShadowHostCount
   });
@@ -482,16 +489,16 @@ def _worker_result(
     *,
     reason_code: str | None = None,
     message: str | None = None,
-    manifest: str | None = None,
     artifacts: dict[str, str] | None = None,
+    artifact_records: list[dict[str, Any]] | None = None,
     evidence: dict[str, Any] | None = None,
     media_validation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "status": status,
         "runId": run_id,
-        "manifest": manifest,
         "artifacts": artifacts or {},
+        "artifactRecords": artifact_records or [],
         "evidence": evidence or {},
         "mediaValidation": media_validation or {
             "status": "blocked" if status == "blocked" else "partial",
@@ -1265,6 +1272,12 @@ def _phase_bucket(long_tasks: list[dict[str, float]], phases: list[dict[str, Any
     }
 
 
+def _consent_passed(consent: dict[str, Any]) -> bool:
+    if consent.get("mode") == "accept":
+        return consent.get("action") == "accepted" and consent.get("bannerVisible") is False
+    return consent.get("verified") is True
+
+
 def build_jank_report(
     *,
     final_url: str,
@@ -1288,9 +1301,11 @@ def build_jank_report(
         if math.isfinite(start_time) and math.isfinite(duration) and start_time >= 0 and duration >= LONG_TASK_THRESHOLD_MS:
             long_tasks.append({"startTime": start_time, "duration": duration})
     total_blocking = round(sum(item["duration"] - LONG_TASK_THRESHOLD_MS for item in long_tasks))
+    consent_incomplete = not _consent_passed(consent) or (
+        consent.get("mode") != "accept" and bool(consent.get("blindSpots"))
+    )
     status = "partial" if (
-        not observer_ready or observer_error or not consent.get("verified")
-        or consent.get("blindSpots") or interaction_failures
+        not observer_ready or observer_error or consent_incomplete or interaction_failures
         or scroll.get("timedOut") or scroll.get("truncated") or scroll.get("completed") is not True
     ) else "valid"
     return {
@@ -1406,13 +1421,17 @@ async def _consent_elements(page: Any, selector: str) -> list[Any]:
 
 CONSENT_SCOPE_SCRIPT = r"""
 () => {
-  const known = "[role='dialog'],[aria-modal='true'],#onetrust-banner-sdk,#CybotCookiebotDialog,#didomi-host";
-  const scope = known + ",[id*='cookie' i],[class*='cookie' i],[id*='consent' i],[class*='consent' i],[data-testid*='consent' i],.cc-cmp-banner";
+  const known = "#onetrust-banner-sdk,#CybotCookiebotDialog,#didomi-host";
+  const named = [
+    "[id*='cookie' i]", "[class*='cookie' i]", "[id*='consent' i]",
+    "[class*='consent' i]", "[data-testid*='consent' i]", ".cc-cmp-banner"
+  ].join(",");
+  const scope = known + "," + named + ",[role='dialog'],[aria-modal='true']";
   let element = this;
   while (element) {
     if (element.matches(scope)) {
       const text = (element.innerText || element.textContent || "") + " " + (element.getAttribute("aria-label") || "");
-      if (element.matches(known) || /cookie|consent|privacy|tracking|personal data/i.test(text)) return true;
+      if (element.matches(known) || element.matches(named) || /cookie|consent|privacy|tracking|personal data/i.test(text)) return true;
     }
     element = element.parentElement || element.getRootNode().host;
   }
@@ -1421,12 +1440,13 @@ CONSENT_SCOPE_SCRIPT = r"""
 """
 
 
-async def _inspect_consent(page: Any, request: dict[str, Any]) -> dict[str, int]:
+async def _inspect_consent(page: Any, request: dict[str, Any]) -> dict[str, Any]:
     result = await _page_json(page, CONSENT_SCAN_SCRIPT, label="consent scan")
     if not isinstance(result, dict):
         raise WorkerFailure("consent-unverified", "Consent scan returned an invalid result", status="partial")
     scan = {
         "visibleSurfaceCount": int(result.get("visibleSurfaceCount", 0)),
+        "bannerVisible": result.get("bannerVisible") is True,
         "iframeCount": int(result.get("iframeCount", 0)),
         "openShadowHostCount": int(result.get("openShadowHostCount", 0)),
     }
@@ -1550,9 +1570,11 @@ async def handle_consent(page: Any, request: dict[str, Any], phase: str) -> dict
         "mode": mode, "phase": phase, "verified": False, "dismissed": False,
         "actionTaken": False, "outcome": "not-attempted", "selector": None,
         "attempts": [], "reason": None, "blindSpots": [], "clicks": 0, "budgetMs": 0,
+        "bannerVisible": None,
     }
     if mode == "none":
         scan = await _inspect_consent(page, request)
+        result["bannerVisible"] = scan.get("bannerVisible")
         if scan["iframeCount"]:
             result["blindSpots"].append({"kind": "iframe-consent-not-inspected", "count": scan["iframeCount"]})
         if scan["openShadowHostCount"]:
@@ -1566,12 +1588,13 @@ async def handle_consent(page: Any, request: dict[str, Any], phase: str) -> dict
         await asyncio.sleep(min(request["consent_wait_ms"], request["consent_budget_ms"]) / 1000)
     initial = await _inspect_consent(page, request)
     result["initialSurfaceCount"] = initial["visibleSurfaceCount"]
+    result["bannerVisible"] = initial.get("bannerVisible")
     if initial["iframeCount"]:
         result["blindSpots"].append({"kind": "iframe-consent-not-inspected", "count": initial["iframeCount"]})
     if initial["openShadowHostCount"]:
         result["blindSpots"].append({"kind": "open-shadow-consent-not-inspected", "count": initial["openShadowHostCount"]})
     if initial["visibleSurfaceCount"] == 0:
-        result["verified"] = not result["blindSpots"]
+        result["verified"] = mode != "accept" and not result["blindSpots"]
         result["outcome"] = "no-consent-surface" if result["verified"] else "consent-surface-unverified"
         result["budgetMs"] = round((time.monotonic() - started) * 1000)
         return result
@@ -1653,31 +1676,51 @@ async def handle_consent(page: Any, request: dict[str, Any], phase: str) -> dict
                 result["outcome"] = "no-safe-action"
 
     remaining = await _inspect_consent(page, request)
-    while remaining["visibleSurfaceCount"] and result["actionTaken"] and not result["blindSpots"]:
-        if remaining["iframeCount"] or remaining["openShadowHostCount"]:
+    surface_visible = (
+        remaining.get("bannerVisible") is not False
+        if mode == "accept"
+        else remaining["visibleSurfaceCount"] > 0
+    )
+    while surface_visible and result["actionTaken"] and (
+        mode == "accept" or not result["blindSpots"]
+    ):
+        if mode != "accept" and (remaining["iframeCount"] or remaining["openShadowHostCount"]):
             break
         budget_remaining = request["consent_budget_ms"] - round((time.monotonic() - started) * 1000)
         if budget_remaining <= 0:
             break
         await asyncio.sleep(min(0.1, budget_remaining / 1000))
         remaining = await _inspect_consent(page, request)
+        surface_visible = (
+            remaining.get("bannerVisible") is not False
+            if mode == "accept"
+            else remaining["visibleSurfaceCount"] > 0
+        )
     if remaining["iframeCount"] and not any(item.get("kind") == "iframe-consent-not-inspected" for item in result["blindSpots"]):
         result["blindSpots"].append({"kind": "iframe-consent-not-inspected", "count": remaining["iframeCount"]})
     if remaining["openShadowHostCount"] and not any(item.get("kind") == "open-shadow-consent-not-inspected" for item in result["blindSpots"]):
         result["blindSpots"].append({"kind": "open-shadow-consent-not-inspected", "count": remaining["openShadowHostCount"]})
-    result["verified"] = (
-        remaining["visibleSurfaceCount"] == 0
-        and not result["blindSpots"]
-        and (mode != "reject" or initial["visibleSurfaceCount"] == 0 or result.get("action") == "rejected")
-    )
+    result["bannerVisible"] = remaining.get("bannerVisible")
+    if mode == "accept":
+        result["verified"] = result.get("action") == "accepted" and result["bannerVisible"] is False
+    else:
+        result["verified"] = (
+            remaining["visibleSurfaceCount"] == 0
+            and not result["blindSpots"]
+            and (mode != "reject" or initial["visibleSurfaceCount"] == 0 or result.get("action") == "rejected")
+        )
     result["dismissed"] = result["verified"] and result["actionTaken"]
     result["outcome"] = "dismissed" if result["dismissed"] else (
         "no-consent-surface" if result["verified"] else result.get("outcome") or "surface-remains-or-unverified"
     )
     result["budgetMs"] = round((time.monotonic() - started) * 1000)
-    result["reason"] = result["reason"] or (
-        "consent state verified after bounded handling" if result["verified"] else "consent state could not be verified"
-    )
+    if not result["reason"]:
+        if mode == "accept" and result["verified"]:
+            result["reason"] = "cookies accepted and consent banner dismissed"
+        elif result["verified"]:
+            result["reason"] = "consent state verified after bounded handling"
+        else:
+            result["reason"] = "consent state could not be verified"
     return result
 
 
@@ -1689,16 +1732,40 @@ def combine_consent(
 ) -> dict[str, Any]:
     results = [item for item in (preflight, *(history or []), recorded) if item is not None]
     blind_spots = [spot for item in results for spot in item.get("blindSpots", [])]
-    verified = bool(recorded.get("verified")) and not blind_spots and all(item.get("verified") for item in results)
+    accepted_action = any(
+        item.get("action") == "accepted" for item in results
+    )
     reject_action = any(item.get("action") == "rejected" for item in results)
+    if mode == "accept":
+        verified = accepted_action and recorded.get("bannerVisible") is False
+        dismissed = verified
+        outcome = "dismissed" if verified else recorded.get("outcome", "not-attempted")
+        action = "accepted" if accepted_action else recorded.get("action", "none")
+        reason = (
+            "cookies accepted and consent banner dismissed"
+            if verified
+            else recorded.get("reason")
+        )
+    else:
+        verified = (
+            bool(recorded.get("verified"))
+            and not blind_spots
+            and all(item.get("verified") for item in results)
+        )
+        dismissed = any(bool(item.get("dismissed")) for item in results)
+        outcome = recorded.get("outcome", "not-attempted")
+        action = "rejected" if mode == "reject" and reject_action else recorded.get("action", "none")
+        reason = recorded.get("reason")
     return {
         "mode": mode,
         "verified": verified,
-        "dismissed": any(bool(item.get("dismissed")) for item in results),
+        "dismissed": dismissed,
         "blindSpots": blind_spots,
         "actionTaken": any(item.get("actionTaken") for item in results),
-        "outcome": recorded.get("outcome", "not-attempted"),
-        "action": "rejected" if mode == "reject" and reject_action else recorded.get("action", "none"),
+        "bannerVisible": recorded.get("bannerVisible"),
+        "outcome": outcome,
+        "action": action,
+        "reason": reason,
         "selector": recorded.get("selector"),
         "preflight": preflight,
         "recorded": recorded,
@@ -1928,45 +1995,17 @@ async def _browser_runtime_versions(browser_version: str) -> dict[str, str]:
     }
 
 
-def _write_manifest(
-    output_dir: Path,
-    run_id: str,
-    request: dict[str, Any],
-    final_url: str,
-    records: list[dict[str, Any]],
-) -> str:
-    source_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    manifest = {
-        "contractVersion": CONTRACT_VERSION,
-        "runId": run_id,
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "recorder": {"version": "0.1.0", "sha256": source_hash},
-        "url": _redacted_url(request["url"]),
-        "finalUrl": _redacted_url(final_url),
-        "viewport": {
-            "width": request["width"], "height": request["height"],
-            "mobile": request["mobile"], "reducedMotion": request["reduced_motion"],
-        },
-        "modes": {"gpu": True, "scroll": request["scroll"]},
-        "files": records,
-    }
-    manifest_path = output_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return manifest_path.name
-
-
 async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
     run_id = request["run_id"]
     output_dir: Path = request["output_dir"]
     name = request["name"]
     webm_path = output_dir / f"{name}.webm"
     jank_path = output_dir / f"{name}.jank.json"
-    manifest_path = output_dir / "manifest.json"
     if output_dir.exists() and not output_dir.is_dir():
         return _worker_result("blocked", run_id, reason_code="output-dir-invalid", message="Run output path is not a directory")
     if output_dir.exists() and any(output_dir.iterdir()) and not request["overwrite"]:
         return _worker_result("blocked", run_id, reason_code="output-exists", message="Run directory is not empty")
-    for path in (webm_path, jank_path, manifest_path):
+    for path in (webm_path, jank_path):
         if path.exists() and path.is_symlink():
             return _worker_result("blocked", run_id, reason_code="artifact-symlink", message="Artifact path is a symlink")
     try:
@@ -1987,12 +2026,12 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     if not output_dir.is_dir():
         return _worker_result("blocked", run_id, reason_code="output-dir-invalid", message="Run output path is not a directory")
-    allowed_existing = {webm_path.name, jank_path.name, manifest_path.name}
+    allowed_existing = {webm_path.name, jank_path.name}
     unexpected = [item for item in output_dir.iterdir() if item.name not in allowed_existing]
     if unexpected:
         return _worker_result("blocked", run_id, reason_code="output-dir-not-empty", message="Run directory contains unexpected files")
     if request["overwrite"]:
-        for existing in (webm_path, jank_path, manifest_path):
+        for existing in (webm_path, jank_path):
             if existing.exists():
                 existing.unlink()
     temp_root = Path(tempfile.mkdtemp(prefix=f"bu-{run_id[:8]}-", dir="/tmp"))
@@ -2275,7 +2314,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
             "width": request["width"], "height": request["height"],
             "mobile": request["mobile"], "reducedMotion": request["reduced_motion"],
         },
-        "consent": {"mode": request["consent_mode"], "verified": bool(consent.get("verified"))},
+        "consent": consent,
         "runtime": runtime,
         "gpu": gpu_renderer,
         "settle": settle_evidence,
@@ -2305,25 +2344,17 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
     evidence["cleanupVerified"] = cleanup_ok
     if not cleanup_ok:
         partial_reason = partial_reason or ("cleanup-incomplete", "Browser or temporary-file cleanup was incomplete")
-    if len(records) == 2:
-        try:
-            manifest_name = _write_manifest(output_dir, run_id, request, final_url, records)
-            artifacts["manifest"] = manifest_name
-        except OSError as error:
-            partial_reason = partial_reason or ("manifest-write-failed", _redact_text(error))
-    else:
-        manifest_name = None
     complete = (
-        manifest_name is not None and video_info is not None and jank_report is not None
-        and jank_report["status"] == "valid" and consent.get("verified") is True
+        len(records) == 2 and video_info is not None and jank_report is not None
+        and jank_report["status"] == "valid" and _consent_passed(consent)
         and gpu_verified and cleanup_ok and partial_reason is None
     )
     if complete:
         return _worker_result(
             "complete",
             run_id,
-            manifest=manifest_name,
             artifacts=artifacts,
+            artifact_records=records,
             evidence=evidence,
             media_validation={"status": "valid", **video_info},
         )
@@ -2332,14 +2363,14 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
             partial_reason = ("video-evidence-unavailable", "A valid WebM capture was not produced")
         elif not artifacts.get("jank"):
             partial_reason = ("jank-evidence-unavailable", "A valid jank report was not produced")
-        elif not consent.get("verified"):
+        elif not _consent_passed(consent):
             partial_reason = ("consent-unverified", "Consent state could not be verified")
         else:
             partial_reason = ("evidence-partial", "One or more evidence checks did not pass")
     status = "partial" if artifacts else "blocked"
     return _worker_result(
         status, run_id, reason_code=partial_reason[0], message=partial_reason[1],
-        manifest=manifest_name, artifacts=artifacts, evidence=evidence,
+        artifacts=artifacts, artifact_records=records, evidence=evidence,
         media_validation=(
             {"status": "valid", **video_info}
             if video_info is not None

@@ -788,28 +788,6 @@ def test_manual_click_cannot_escape_approved_host(tmp_path: Path):
     assert raised.value.reason_code == "capture-domain-unverified"
 
 
-def test_manifest_keeps_capture_cell_v2_shape(tmp_path: Path):
-    request = make_request(tmp_path)
-    output_dir = request["output_dir"]
-    output_dir.mkdir(parents=True)
-    records = [
-        {"path": "site.webm", "size": 12, "sha256": "a" * 64},
-        {"path": "site.jank.json", "size": 20, "sha256": "b" * 64},
-    ]
-
-    name = worker._write_manifest(output_dir, request["run_id"], request, request["url"], records)
-    manifest = json.loads((output_dir / name).read_text(encoding="utf-8"))
-
-    assert name == "manifest.json"
-    assert set(manifest) == {
-        "contractVersion", "runId", "generatedAt", "recorder", "url",
-        "finalUrl", "viewport", "modes", "files",
-    }
-    assert manifest["contractVersion"] == "capture-cell.v2"
-    assert manifest["files"] == records
-    assert "browserUse" not in json.dumps(manifest)
-
-
 def test_artifact_hashes_are_stable_and_nonempty(tmp_path: Path):
     artifact = tmp_path / "capture.jank.json"
     artifact.write_bytes(b'{"longTaskCount":0}')
