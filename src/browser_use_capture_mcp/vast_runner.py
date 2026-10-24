@@ -13,7 +13,6 @@ import socket
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import anyio
 
@@ -85,7 +84,7 @@ class VastRunner:
             raise VastRunnerError("vast-cli-unavailable", "The Vast.ai CLI is unavailable")
 
     @staticmethod
-    def build_worker_input(capture: dict[str, Any], run_id: str, run_directory: str) -> dict[str, Any]:
+    def build_worker_input(capture: dict[str, object], run_id: str, run_directory: str) -> dict[str, object]:
         if capture.get("gpu", True) is not True:
             raise VastRunnerError("capture-gpu-required", "Authoritative Browser Use capture requires gpu=true")
         worker_input = {
@@ -405,7 +404,7 @@ class VastRunner:
         )
 
     @staticmethod
-    def _last_json_line(output: bytes) -> dict[str, Any]:
+    def _last_json_line(output: bytes) -> dict[str, object]:
         for line in reversed(output.decode("utf-8", errors="replace").splitlines()):
             try:
                 payload = json.loads(line)
@@ -415,7 +414,7 @@ class VastRunner:
                 return payload
         raise VastRunnerError("remote-result-invalid", "The remote runner did not return a JSON result", _safe_output(output))
 
-    async def check_compatibility(self) -> dict[str, Any]:
+    async def check_compatibility(self) -> dict[str, object]:
         connection = await self.connection()
         await self.sync_project(connection)
         probe_directory = f"{REMOTE_RUNS}/{uuid.uuid4()}"
@@ -445,8 +444,10 @@ class VastRunner:
                 raise
             payload = self._last_json_line(error.diagnostic.encode("utf-8") if error.diagnostic else b"")
         payload["vastInstanceId"] = self.instance_id
-        cpu = payload.get("cpu", {})
-        gpu = payload.get("gpu", {})
+        cpu_value = payload.get("cpu", {})
+        gpu_value = payload.get("gpu", {})
+        cpu = cpu_value if isinstance(cpu_value, dict) else {}
+        gpu = gpu_value if isinstance(gpu_value, dict) else {}
         if payload.get("browserExecutable") != self.browser_path:
             payload["status"] = "blocked"
             payload["failureReason"] = "compatibility result did not match configured browser executable"
@@ -498,7 +499,7 @@ class VastRunner:
         except (VastRunnerError, asyncio.CancelledError):
             return False
 
-    async def capture(self, capture: dict[str, Any], local_stage: Path) -> dict[str, Any]:
+    async def capture(self, capture: dict[str, object], local_stage: Path) -> dict[str, object]:
         connection = await self.connection()
         await self.sync_project(connection)
         run_id = str(uuid.uuid4())

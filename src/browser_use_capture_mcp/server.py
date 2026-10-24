@@ -67,7 +67,7 @@ def _redact(value: str) -> str:
     return text
 
 
-def _redact_output(value: Any) -> Any:
+def _redact_output(value: object) -> object:
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         for key, item in value.items():
@@ -95,7 +95,7 @@ def _redact_url(value: str) -> str:
         return "[REDACTED URL]"
 
 
-def _blocked(reason_code: str, message: str, *, diagnostic: str | None = None, **details: Any) -> dict[str, Any]:
+def _blocked(reason_code: str, message: str, *, diagnostic: str | None = None, **details: object) -> dict[str, object]:
     payload: dict[str, Any] = {
         "status": "blocked",
         "reasonCode": reason_code,
@@ -114,7 +114,7 @@ def _validate_url(raw_url: str) -> str:
     return raw_url
 
 
-def _bounded_int(value: Any, field: str, default: int, minimum: int, maximum: int) -> int:
+def _bounded_int(value: object, field: str, default: int, minimum: int, maximum: int) -> int:
     if value is None:
         value = default
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
@@ -122,7 +122,7 @@ def _bounded_int(value: Any, field: str, default: int, minimum: int, maximum: in
     return value
 
 
-def _bool_option(value: Any, field: str, default: bool = False) -> bool:
+def _bool_option(value: object, field: str, default: bool = False) -> bool:
     if value is None:
         return default
     if not isinstance(value, bool):
@@ -130,7 +130,7 @@ def _bool_option(value: Any, field: str, default: bool = False) -> bool:
     return value
 
 
-def _selector(value: Any, field: str) -> str | None:
+def _selector(value: object, field: str) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or len(value) > 300 or "\x00" in value:
@@ -138,7 +138,7 @@ def _selector(value: Any, field: str) -> str | None:
     return value
 
 
-def _output_directory(value: Any) -> Path:
+def _output_directory(value: object) -> Path:
     if value is not None and not isinstance(value, str):
         raise ValueError("output_dir must be a path string")
     output_dir = Path(value or os.environ.get("BROWSER_USE_CAPTURE_OUTPUT_DIR", DEFAULT_OUTPUT)).expanduser()
@@ -154,7 +154,7 @@ def _output_directory(value: Any) -> Path:
     return output_dir
 
 
-def _capture_target_error(targets: dict[str, Path], overwrite: bool) -> dict[str, Any] | None:
+def _capture_target_error(targets: dict[str, Path], overwrite: bool) -> dict[str, object] | None:
     if _has_symlink_targets(targets):
         return _blocked("capture-target-symlink", "Capture output targets must not be symbolic links")
     if not overwrite and any(path.exists() for path in targets.values()):
@@ -162,7 +162,7 @@ def _capture_target_error(targets: dict[str, Path], overwrite: bool) -> dict[str
     return None
 
 
-def _validate_capture_input(input_data: dict[str, Any]) -> dict[str, Any]:
+def _validate_capture_input(input_data: dict[str, object]) -> dict[str, object]:
     url = _validate_url(str(input_data.get("url", "")))
     consent_mode = input_data.get("consent_mode", "reject")
     if consent_mode not in {"reject", "accept", "none", "granular"}:
@@ -221,7 +221,7 @@ def _validate_capture_input(input_data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _browser_use_compatibility_gate() -> dict[str, Any] | None:
+def _browser_use_compatibility_gate() -> dict[str, object] | None:
     try:
         VastRunner().validate_configuration()
     except VastRunnerError as error:
@@ -229,7 +229,7 @@ def _browser_use_compatibility_gate() -> dict[str, Any] | None:
     return None
 
 
-def _issue_capability_record(probe: dict[str, Any], runner: VastRunner) -> dict[str, Any]:
+def _issue_capability_record(probe: dict[str, object], runner: VastRunner) -> dict[str, object]:
     capability_id = uuid.uuid4().hex
     _CAPABILITY_RECORDS[capability_id] = {
         "created_at": time.time(),
@@ -250,7 +250,7 @@ def _issue_capability_record(probe: dict[str, Any], runner: VastRunner) -> dict[
     }
 
 
-def _verified_capability(capability_id: str | None, runner: VastRunner) -> dict[str, Any] | None:
+def _verified_capability(capability_id: str | None, runner: VastRunner) -> dict[str, object] | None:
     if not capability_id:
         return _blocked("gpu-check-required", "A verified gpu_check_id is required")
     record = _CAPABILITY_RECORDS.get(capability_id)
@@ -264,7 +264,7 @@ def _verified_capability(capability_id: str | None, runner: VastRunner) -> dict[
     return None
 
 
-def artifact_digest(path: Path) -> dict[str, Any]:
+def artifact_digest(path: Path) -> dict[str, object]:
     digest = hashlib.sha256()
     size = 0
     with path.open("rb") as source:
@@ -274,7 +274,7 @@ def artifact_digest(path: Path) -> dict[str, Any]:
     return {"path": str(path), "size": size, "sha256": digest.hexdigest()}
 
 
-def validate_media(path: Path, ffprobe: str = "ffprobe") -> dict[str, Any]:
+def validate_media(path: Path, ffprobe: str = "ffprobe") -> dict[str, object]:
     if not path.is_file() or path.stat().st_size == 0:
         return {"status": "blocked", "reason": "zero-byte WebM"}
     with path.open("rb") as source:
@@ -307,7 +307,7 @@ def validate_media(path: Path, ffprobe: str = "ffprobe") -> dict[str, Any]:
     return {"status": "valid", "format": format_data["format_name"], "durationSeconds": duration, "videoStreamCount": video_stream_count}
 
 
-def _consent_passed(consent: Any) -> bool:
+def _consent_passed(consent: object) -> bool:
     if not isinstance(consent, dict):
         return False
     if consent.get("mode") == "accept":
@@ -315,7 +315,7 @@ def _consent_passed(consent: Any) -> bool:
     return consent.get("verified") is True and not consent.get("blindSpots")
 
 
-def _validate_jank_report(report: Any) -> dict[str, Any]:
+def _validate_jank_report(report: object) -> dict[str, object]:
     if not isinstance(report, dict) or report.get("schemaVersion") != "jank-report.v1":
         raise ValueError("jank report schema validation failed")
     if report.get("status") not in {"valid", "partial"}:
@@ -367,7 +367,7 @@ def _has_symlink_targets(targets: dict[str, Path]) -> bool:
 
 
 def _validate_remote_artifacts(
-    records: Any, stage_dir: Path, name: str, *, require_all: bool = True
+    records: object, stage_dir: Path, name: str, *, require_all: bool = True
 ) -> set[str]:
     expected_names = {f"{name}.webm", f"{name}.jank.json"}
     if not isinstance(records, list) or (require_all and len(records) != len(expected_names)):
@@ -391,7 +391,7 @@ def _validate_remote_artifacts(
     return seen
 
 
-async def _compatibility_result(runner: VastRunner) -> dict[str, Any]:
+async def _compatibility_result(runner: VastRunner) -> dict[str, object]:
     try:
         probe = await runner.check_compatibility()
     except VastRunnerError as error:
@@ -437,7 +437,7 @@ async def _compatibility_result(runner: VastRunner) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def check_capture_gpu(dry_run: bool = False) -> dict[str, Any]:
+async def check_capture_gpu(dry_run: bool = False) -> dict[str, object]:
     """Check runner, browser, recording, jank, and NVIDIA WebGL support. With dry_run=true, return the checks without contacting the runner."""
     try:
         dry_run = _bool_option(dry_run, "dry_run")
@@ -499,7 +499,7 @@ async def capture_site_motion(
     overwrite: bool = False,
     gpu_check_id: str | None = None,
     dry_run: bool = False,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Capture one motion-evidence cell. With dry_run=true, validate and return its plan without starting a runner or writing files."""
     raw = locals().copy()
     raw.pop("gpu_check_id")

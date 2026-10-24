@@ -26,9 +26,10 @@ import tempfile
 import time
 import uuid
 from collections import deque
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
@@ -41,6 +42,9 @@ CAPTURE_FPS = 30
 MAX_REQUEST_BYTES = 1_000_000
 MAX_TIMEOUT_MS = 270_000
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+SocketAddress = tuple[str, int] | tuple[str, int, int, int]
+AddressRecord = tuple[int, int, int, str, SocketAddress]
+AddressResolver = Callable[..., list[AddressRecord]]
 SENSITIVE_VALUE_PATTERN = re.compile(
     r"((?:authorization|api[_-]?key|token|secret|password|cookie|set-cookie)\s*[:=]\s*)[^\s,;]+",
     re.IGNORECASE,
@@ -162,6 +166,73 @@ class CDPError(RuntimeError):
     pass
 
 
+class WebSocketMessageChannel(Protocol):
+    def __aiter__(self) -> AsyncIterator[str | bytes]: ...
+
+    async def send(self, message: str) -> None: ...
+
+    async def close(self) -> None: ...
+
+
+class BrowserUseElement(Protocol):
+    async def evaluate(self, expression: str) -> object: ...
+
+    async def click(self) -> object: ...
+
+    async def hover(self) -> object: ...
+
+
+class BrowserUseMouse(Protocol):
+    async def scroll(self, x: int, y: int, delta_y: int, delta_x: int) -> object: ...
+
+
+class BrowserUseDomApi(Protocol):
+    async def getDocument(
+        self, params: dict[str, object], *, session_id: str
+    ) -> dict[str, object]: ...
+
+    async def querySelectorAll(
+        self, params: dict[str, object], *, session_id: str
+    ) -> dict[str, object]: ...
+
+    async def describeNode(
+        self, params: dict[str, object], *, session_id: str
+    ) -> dict[str, object]: ...
+
+
+class BrowserUseCdpSend(Protocol):
+    DOM: BrowserUseDomApi
+
+
+class BrowserUseCdpClient(Protocol):
+    send: BrowserUseCdpSend
+
+
+class BrowserUsePage(Protocol):
+    _client: BrowserUseCdpClient
+    mouse: Awaitable[BrowserUseMouse]
+
+    async def evaluate(self, expression: str) -> object: ...
+
+    async def goto(self, url: str) -> object: ...
+
+    async def set_viewport_size(self, width: int, height: int) -> object: ...
+
+    async def get_url(self) -> str: ...
+
+    async def get_target_info(self) -> dict[str, object]: ...
+
+    async def get_elements_by_css_selector(self, selector: str) -> list[BrowserUseElement]: ...
+
+    async def get_element(self, backend_node_id: int) -> BrowserUseElement | None: ...
+
+    async def _ensure_session(self) -> str: ...
+
+
+class BrowserUseSession(Protocol):
+    async def kill(self) -> object: ...
+
+
 def _redact_text(value: object) -> str:
     text = str(value)
     text = SENSITIVE_VALUE_PATTERN.sub(r"\1[REDACTED]", text)
@@ -201,21 +272,21 @@ def _log(message: object) -> None:
     sys.stderr.flush()
 
 
-def _required_bool(payload: dict[str, Any], key: str, default: bool) -> bool:
+def _required_bool(payload: dict[str, object], key: str, default: bool) -> bool:
     value = payload.get(key, default)
     if type(value) is not bool:
         raise ValueError(f"{key} must be a boolean")
     return value
 
 
-def _bounded_int(payload: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+def _bounded_int(payload: dict[str, object], key: str, default: int, low: int, high: int) -> int:
     value = payload.get(key, default)
     if type(value) is not int or not low <= value <= high:
         raise ValueError(f"{key} must be an integer from {low} to {high}")
     return value
 
 
-def _selector_list(payload: dict[str, Any], plural: str, singular: str | None = None) -> list[str]:
+def _selector_list(payload: dict[str, object], plural: str, singular: str | None = None) -> list[str]:
     value: Any = payload.get(plural)
     if value is None and singular:
         value = payload.get(singular)
@@ -232,7 +303,7 @@ def _selector_list(payload: dict[str, Any], plural: str, singular: str | None = 
     return [item.strip() for item in result]
 
 
-def _canonical_run_id(value: Any) -> str:
+def _canonical_run_id(value: object) -> str:
     if not isinstance(value, str):
         raise ValueError("run_id must be a canonical UUID")
     try:
@@ -244,7 +315,7 @@ def _canonical_run_id(value: Any) -> str:
     return value
 
 
-def _validate_run_location(run_id: str, output_dir: Any, runs_root: Path = RUNS_ROOT) -> Path:
+def _validate_run_location(run_id: str, output_dir: object, runs_root: Path = RUNS_ROOT) -> Path:
     if not isinstance(output_dir, str) or not Path(output_dir).is_absolute():
         raise ValueError("output_dir must be an absolute path")
     root = runs_root.resolve(strict=False)
@@ -265,7 +336,7 @@ def _validate_run_location(run_id: str, output_dir: Any, runs_root: Path = RUNS_
     raise ValueError("output_dir must be the run_id directory or its artifacts child below the capture runs root")
 
 
-def _safe_basename(value: Any) -> str:
+def _safe_basename(value: object) -> str:
     if not isinstance(value, str) or not NAME_PATTERN.fullmatch(value):
         raise ValueError("name must be a safe basename")
     if Path(value).name != value or value in {".", ".."} or "/" in value or "\\" in value:
@@ -273,9 +344,11 @@ def _safe_basename(value: Any) -> str:
     return value
 
 
-def validate_request(payload: Any, *, runs_root: Path = RUNS_ROOT) -> dict[str, Any]:
+def validate_request(payload: object, *, runs_root: Path = RUNS_ROOT) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError("input must be one JSON object")
+    if any(not isinstance(key, str) for key in payload):
+        raise ValueError("input object keys must be strings")
     run_id = _canonical_run_id(payload.get("run_id"))
     output_dir = _validate_run_location(run_id, payload.get("output_dir"), runs_root)
     name = _safe_basename(payload.get("name", f"capture-{run_id[:8]}"))
@@ -384,8 +457,8 @@ def _redacted_url(raw_url: str) -> str:
 
 def validate_http_url(
     raw_url: str,
-    resolver: Callable[..., list[tuple[Any, ...]]] | None = socket.getaddrinfo,
-) -> dict[str, Any]:
+    resolver: AddressResolver | None = socket.getaddrinfo,
+) -> dict[str, object]:
     try:
         parts = urlsplit(raw_url)
         port = parts.port
@@ -428,8 +501,8 @@ def _validate_approved_domain(
     approved_hostname: str,
     *,
     stage: str,
-    resolver: Callable[..., list[tuple[Any, ...]]] | None = None,
-) -> dict[str, Any]:
+    resolver: AddressResolver | None = None,
+) -> dict[str, object]:
     try:
         candidate = urlsplit(raw_url).hostname
         normalized = candidate.encode("idna").decode("ascii").lower().rstrip(".") if candidate else ""
@@ -449,7 +522,7 @@ def _validate_approved_domain(
 
 
 async def _wait_for_approved_navigation(
-    page: Any,
+    page: BrowserUsePage,
     approved_hostname: str,
     *,
     stage: str,
@@ -490,10 +563,10 @@ def _worker_result(
     reason_code: str | None = None,
     message: str | None = None,
     artifacts: dict[str, str] | None = None,
-    artifact_records: list[dict[str, Any]] | None = None,
-    evidence: dict[str, Any] | None = None,
-    media_validation: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    artifact_records: list[dict[str, object]] | None = None,
+    evidence: dict[str, object] | None = None,
+    media_validation: dict[str, object] | None = None,
+) -> dict[str, object]:
     result: dict[str, Any] = {
         "status": status,
         "runId": run_id,
@@ -514,7 +587,7 @@ def _worker_result(
     return result
 
 
-def _parse_json_value(value: Any, label: str) -> Any:
+def _parse_json_value(value: object, label: str) -> object:
     if isinstance(value, str):
         try:
             return json.loads(value)
@@ -523,7 +596,7 @@ def _parse_json_value(value: Any, label: str) -> Any:
     return value
 
 
-async def _page_json(page: Any, expression: str, *, label: str = "Page.evaluate") -> Any:
+async def _page_json(page: BrowserUsePage, expression: str, *, label: str = "Page.evaluate") -> object:
     value = await page.evaluate(expression)
     return _parse_json_value(value, label)
 
@@ -531,7 +604,7 @@ async def _page_json(page: Any, expression: str, *, label: str = "Page.evaluate"
 class CDPSocket:
     """Small request multiplexer for the per-target CDP WebSocket."""
 
-    def __init__(self, websocket: Any) -> None:
+    def __init__(self, websocket: WebSocketMessageChannel) -> None:
         self.websocket = websocket
         self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self.next_id = 0
@@ -542,7 +615,7 @@ class CDPSocket:
         self.last_network_activity = asyncio.get_running_loop().time()
         self.reader_error: str | None = None
 
-    def set_screencast_handler(self, handler: Callable[[dict[str, Any]], Any] | None) -> None:
+    def set_screencast_handler(self, handler: Callable[[dict[str, object]], object] | None) -> None:
         self.screencast_handler = handler
 
     async def ack_screencast_frame(self, session_id: int) -> None:
@@ -556,7 +629,7 @@ class CDPSocket:
             async for raw in self.websocket:
                 message = json.loads(raw)
                 message_id = message.get("id")
-                if isinstance(message_id, int):
+                if type(message_id) is int:
                     future = self.pending.pop(message_id, None)
                     if future and not future.done():
                         if "error" in message:
@@ -599,10 +672,10 @@ class CDPSocket:
     async def command(
         self,
         method: str,
-        params: dict[str, Any] | None = None,
+        params: dict[str, object] | None = None,
         *,
         timeout: float = 15,
-    ) -> dict[str, Any]:
+    ) -> dict[str, object]:
         if self.reader_error:
             raise CDPError(self.reader_error)
         self.next_id += 1
@@ -638,8 +711,8 @@ class CDPSocket:
             pass
 
 
-async def _http_json(url: str, timeout: float = 2) -> Any:
-    def read() -> Any:
+async def _http_json(url: str, timeout: float = 2) -> object:
+    def read() -> object:
         from urllib.request import urlopen
 
         with urlopen(url, timeout=timeout) as response:
@@ -653,7 +726,7 @@ async def wait_for_cdp(
     process: asyncio.subprocess.Process,
     timeout: float = 30,
     stderr_task: asyncio.Task[str] | None = None,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     deadline = asyncio.get_running_loop().time() + timeout
     endpoint = f"http://127.0.0.1:{port}/json/version"
     last_error = "CDP endpoint did not become ready"
@@ -671,6 +744,8 @@ async def wait_for_cdp(
             raise WorkerFailure("browser-startup-failed", message)
         try:
             result = await _http_json(endpoint, timeout=1)
+            if not isinstance(result, dict):
+                raise ValueError("Chrome CDP version response was not an object")
             websocket_url = result.get("webSocketDebuggerUrl")
             browser_version = result.get("Browser")
             if isinstance(websocket_url, str) and isinstance(browser_version, str):
@@ -693,7 +768,7 @@ async def _drain_stderr(stream: asyncio.StreamReader | None) -> str:
     return _redact_text(b"".join(tail).decode("utf-8", errors="replace"))
 
 
-async def _page_target_id(page: Any) -> str:
+async def _page_target_id(page: BrowserUsePage) -> str:
     target_info = await page.get_target_info()
     target_id = target_info.get("targetId")
     if not isinstance(target_id, str) or not target_id:
@@ -703,8 +778,12 @@ async def _page_target_id(page: Any) -> str:
 
 async def _target_websocket_url(port: int, target_id: str) -> str:
     targets = await _http_json(f"http://127.0.0.1:{port}/json/list")
+    if not isinstance(targets, list):
+        raise WorkerFailure("browser-target-unavailable", "Browser Use targets response was invalid")
     for target in targets:
-        if str(target.get("id")) == target_id:
+        if not isinstance(target, dict):
+            continue
+        if target.get("id") == target_id:
             websocket_url = target.get("webSocketDebuggerUrl")
             if isinstance(websocket_url, str) and websocket_url.startswith("ws://127.0.0.1:"):
                 return websocket_url
@@ -773,7 +852,7 @@ def _chromium_sandbox_enabled() -> bool:
 
 
 def _clean_chrome_args(
-    args: Any,
+    args: object,
     port: int,
     profile_dir: Path,
 ) -> list[str]:
@@ -866,8 +945,8 @@ def _browser_profile_options(
     profile_dir: Path,
     cdp_origin: str,
     approved_hostname: str,
-    request: dict[str, Any],
-) -> dict[str, Any]:
+    request: dict[str, object],
+) -> dict[str, object]:
     if "browser-use-user-data-dir-" not in str(profile_dir):
         raise WorkerFailure(
             "browser-profile-invalid",
@@ -927,7 +1006,7 @@ async def _terminate_browser(process: asyncio.subprocess.Process | None) -> bool
         return process.returncode is not None
 
 
-async def cleanup_browser_lifecycle(session: Any, process: asyncio.subprocess.Process | None) -> bool:
+async def cleanup_browser_lifecycle(session: BrowserUseSession | None, process: asyncio.subprocess.Process | None) -> bool:
     cleanup_ok = True
     if session is not None:
         try:
@@ -1015,7 +1094,7 @@ class ScreencastRecordingSession:
         self.frame_count = 0
         self.pump_task: asyncio.Task[int] | None = None
 
-    async def handle_frame(self, params: dict[str, Any]) -> None:
+    async def handle_frame(self, params: dict[str, object]) -> None:
         data = params.get("data")
         session_id = params.get("sessionId")
         if isinstance(data, str) and data:
@@ -1104,7 +1183,7 @@ async def start_native_recording(
         fps=CAPTURE_FPS,
     )
 
-    def on_frame_sync(params: dict[str, Any]) -> None:
+    def on_frame_sync(params: dict[str, object]) -> None:
         asyncio.create_task(session.handle_frame(params))
 
     cdp.set_screencast_handler(on_frame_sync)
@@ -1148,7 +1227,7 @@ async def stop_native_recording(cdp: CDPSocket, session: ScreencastRecordingSess
     return target_path.stat().st_size
 
 
-async def convert_and_validate_video(source: Path, destination: Path) -> dict[str, Any]:
+async def convert_and_validate_video(source: Path, destination: Path) -> dict[str, object]:
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
     if not ffmpeg or not ffprobe:
@@ -1185,7 +1264,7 @@ async def convert_and_validate_video(source: Path, destination: Path) -> dict[st
     return await validate_webm(destination)
 
 
-async def validate_webm(destination: Path) -> dict[str, Any]:
+async def validate_webm(destination: Path) -> dict[str, object]:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         raise WorkerFailure("media-tools-unavailable", "ffprobe is required for WebM evidence")
@@ -1241,7 +1320,7 @@ async def validate_webm(destination: Path) -> dict[str, Any]:
     }
 
 
-def _artifact_record(path: Path) -> dict[str, Any]:
+def _artifact_record(path: Path) -> dict[str, object]:
     if not path.is_file() or path.stat().st_size == 0:
         raise WorkerFailure("artifact-invalid", f"Required evidence artifact is missing or empty: {path.name}", status="partial")
     digest = hashlib.sha256()
@@ -1253,7 +1332,7 @@ def _artifact_record(path: Path) -> dict[str, Any]:
     return {"path": path.name, "size": size, "sha256": digest.hexdigest()}
 
 
-def _phase_bucket(long_tasks: list[dict[str, float]], phases: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+def _phase_bucket(long_tasks: list[dict[str, float]], phases: list[dict[str, object]]) -> dict[str, dict[str, int]]:
     raw: dict[str, dict[str, float]] = {
         str(phase["name"]): {"count": 0, "totalBlockingTimeMs": 0.0}
         for phase in phases
@@ -1272,7 +1351,7 @@ def _phase_bucket(long_tasks: list[dict[str, float]], phases: list[dict[str, Any
     }
 
 
-def _consent_passed(consent: dict[str, Any]) -> bool:
+def _consent_passed(consent: dict[str, object]) -> bool:
     if consent.get("mode") == "accept":
         return consent.get("action") == "accepted" and consent.get("bannerVisible") is False
     return consent.get("verified") is True
@@ -1281,16 +1360,16 @@ def _consent_passed(consent: dict[str, Any]) -> bool:
 def build_jank_report(
     *,
     final_url: str,
-    consent: dict[str, Any],
-    entries: list[dict[str, Any]],
+    consent: dict[str, object],
+    entries: list[dict[str, object]],
     observer_error: str | None,
     observer_ready: bool,
-    phases: list[dict[str, Any]],
+    phases: list[dict[str, object]],
     threshold_ms: int,
     interaction_failures: list[dict[str, str]],
-    interactions: list[dict[str, Any]],
-    scroll: dict[str, Any],
-) -> dict[str, Any]:
+    interactions: list[dict[str, object]],
+    scroll: dict[str, object],
+) -> dict[str, object]:
     long_tasks = []
     for item in entries:
         try:
@@ -1326,7 +1405,7 @@ def build_jank_report(
     }
 
 
-async def _mark_phase(page: Any, phases: list[dict[str, Any]], name: str) -> None:
+async def _mark_phase(page: BrowserUsePage, phases: list[dict[str, object]], name: str) -> None:
     try:
         at = await page.evaluate("() => performance.now()")
         phases.append({"name": name, "at": float(at)})
@@ -1334,7 +1413,7 @@ async def _mark_phase(page: Any, phases: list[dict[str, Any]], name: str) -> Non
         pass
 
 
-async def _configure_page(page: Any, cdp: CDPSocket, request: dict[str, Any]) -> None:
+async def _configure_page(page: BrowserUsePage, cdp: CDPSocket, request: dict[str, object]) -> None:
     await page.set_viewport_size(request["width"], request["height"])
     await cdp.command(
         "Emulation.setDeviceMetricsOverride",
@@ -1393,29 +1472,53 @@ async def _stop_request_guard(cdp: CDPSocket | None, task: asyncio.Task[None] | 
             pass
 
 
-async def _consent_elements(page: Any, selector: str) -> list[Any]:
+async def _consent_elements(page: BrowserUsePage, selector: str) -> list[BrowserUseElement]:
     elements = await page.get_elements_by_css_selector(selector)
-    if not hasattr(page, "_ensure_session"):
+    ensure_session = getattr(page, "_ensure_session", None)
+    if not callable(ensure_session):
         return elements
-    session_id = await page._ensure_session()
+    session_id = await ensure_session()
     client = page._client.send.DOM
     document = await client.getDocument({"depth": -1, "pierce": True}, session_id=session_id)
-    pending = [document["root"]]
+    root = document.get("root")
+    if not isinstance(root, dict):
+        raise WorkerFailure("consent-unverified", "Browser Use returned an invalid DOM document", status="partial")
+    pending: list[dict[str, object]] = [root]
     while pending:
         node = pending.pop()
-        pending.extend(node.get("children", []))
-        for shadow in node.get("shadowRoots", []):
+        children = node.get("children", [])
+        shadow_roots = node.get("shadowRoots", [])
+        if not isinstance(children, list) or not isinstance(shadow_roots, list):
+            raise WorkerFailure("consent-unverified", "Browser Use returned invalid DOM children", status="partial")
+        if any(not isinstance(child, dict) for child in children):
+            raise WorkerFailure("consent-unverified", "Browser Use returned an invalid DOM child", status="partial")
+        pending.extend(children)
+        for shadow in shadow_roots:
+            if not isinstance(shadow, dict):
+                raise WorkerFailure("consent-unverified", "Browser Use returned an invalid shadow root", status="partial")
             if shadow.get("shadowRootType") == "user-agent":
                 continue
             if shadow.get("shadowRootType") != "open":
                 raise WorkerFailure("consent-unverified", "A closed shadow root could not be inspected", status="partial")
+            node_id = shadow.get("nodeId")
+            if type(node_id) is not int:
+                raise WorkerFailure("consent-unverified", "Browser Use returned an invalid shadow root ID", status="partial")
             pending.append(shadow)
             matches = await client.querySelectorAll(
-                {"nodeId": shadow["nodeId"], "selector": selector}, session_id=session_id
+                {"nodeId": node_id, "selector": selector}, session_id=session_id
             )
-            for node_id in matches["nodeIds"]:
+            node_ids = matches.get("nodeIds")
+            if not isinstance(node_ids, list) or any(type(value) is not int for value in node_ids):
+                raise WorkerFailure("consent-unverified", "Browser Use returned invalid DOM node IDs", status="partial")
+            for node_id in node_ids:
                 described = await client.describeNode({"nodeId": node_id}, session_id=session_id)
-                elements.append(await page.get_element(described["node"]["backendNodeId"]))
+                described_node = described.get("node")
+                backend_node_id = described_node.get("backendNodeId") if isinstance(described_node, dict) else None
+                if type(backend_node_id) is not int:
+                    raise WorkerFailure("consent-unverified", "Browser Use returned an invalid backend node ID", status="partial")
+                element = await page.get_element(backend_node_id)
+                if element is not None:
+                    elements.append(element)
     return elements
 
 
@@ -1440,7 +1543,7 @@ CONSENT_SCOPE_SCRIPT = r"""
 """
 
 
-async def _inspect_consent(page: Any, request: dict[str, Any]) -> dict[str, Any]:
+async def _inspect_consent(page: BrowserUsePage, request: dict[str, object]) -> dict[str, object]:
     result = await _page_json(page, CONSENT_SCAN_SCRIPT, label="consent scan")
     if not isinstance(result, dict):
         raise WorkerFailure("consent-unverified", "Consent scan returned an invalid result", status="partial")
@@ -1472,11 +1575,11 @@ async def _inspect_consent(page: Any, request: dict[str, Any]) -> dict[str, Any]
     return scan
 
 
-def _actor_boolean(value: Any) -> bool:
+def _actor_boolean(value: object) -> bool:
     return value is True or (isinstance(value, str) and value.lower() == "true")
 
 
-async def _element_is_visible(element: Any) -> bool:
+async def _element_is_visible(element: BrowserUseElement) -> bool:
     try:
         return _actor_boolean(await element.evaluate(
             "() => { const s=getComputedStyle(this), r=this.getBoundingClientRect(); "
@@ -1486,8 +1589,8 @@ async def _element_is_visible(element: Any) -> bool:
         return False
 
 
-async def _find_selector_candidates(page: Any, selectors: list[str]) -> list[tuple[Any, str]]:
-    candidates: list[tuple[Any, str]] = []
+async def _find_selector_candidates(page: BrowserUsePage, selectors: list[str]) -> list[tuple[BrowserUseElement, str]]:
+    candidates: list[tuple[BrowserUseElement, str]] = []
     for selector in selectors:
         try:
             for element in await _consent_elements(page, selector):
@@ -1498,7 +1601,7 @@ async def _find_selector_candidates(page: Any, selectors: list[str]) -> list[tup
     return candidates
 
 
-async def _generic_consent_buttons(page: Any, phrase: re.Pattern[str]) -> list[tuple[Any, str]]:
+async def _generic_consent_buttons(page: BrowserUsePage, phrase: re.Pattern[str]) -> list[tuple[BrowserUseElement, str]]:
     candidates = []
     try:
         buttons = await _consent_elements(page,
@@ -1525,7 +1628,7 @@ async def _generic_consent_buttons(page: Any, phrase: re.Pattern[str]) -> list[t
 
 
 async def _click_first(
-    page: Any,
+    page: BrowserUsePage,
     selectors: list[str],
     phrase: re.Pattern[str],
     *,
@@ -1564,7 +1667,7 @@ async def _click_first(
     return False, last_error[0], last_error[1]
 
 
-async def handle_consent(page: Any, request: dict[str, Any], phase: str) -> dict[str, Any]:
+async def handle_consent(page: BrowserUsePage, request: dict[str, object], phase: str) -> dict[str, object]:
     mode = request["consent_mode"]
     result: dict[str, Any] = {
         "mode": mode, "phase": phase, "verified": False, "dismissed": False,
@@ -1726,10 +1829,10 @@ async def handle_consent(page: Any, request: dict[str, Any], phase: str) -> dict
 
 def combine_consent(
     mode: str,
-    preflight: dict[str, Any] | None,
-    recorded: dict[str, Any],
-    history: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
+    preflight: dict[str, object] | None,
+    recorded: dict[str, object],
+    history: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
     results = [item for item in (preflight, *(history or []), recorded) if item is not None]
     blind_spots = [spot for item in results for spot in item.get("blindSpots", [])]
     accepted_action = any(
@@ -1772,7 +1875,7 @@ def combine_consent(
     }
 
 
-async def _settle_page(page: Any, cdp: CDPSocket, request: dict[str, Any]) -> dict[str, Any]:
+async def _settle_page(page: BrowserUsePage, cdp: CDPSocket, request: dict[str, object]) -> dict[str, object]:
     idle_reached = True
     if request["wait_idle"]:
         idle_reached = await cdp.wait_for_network_idle(request["idle_timeout_ms"])
@@ -1790,11 +1893,11 @@ async def _settle_page(page: Any, cdp: CDPSocket, request: dict[str, Any]) -> di
 
 
 async def _run_hover_click(
-    page: Any,
-    request: dict[str, Any],
+    page: BrowserUsePage,
+    request: dict[str, object],
     approved_hostname: str,
     failures: list[dict[str, str]],
-    interactions: list[dict[str, Any]],
+    interactions: list[dict[str, object]],
 ) -> None:
     for kind, selectors, wait_ms in (
         ("hover", request["hover_selectors"], request["hover_wait_ms"]),
@@ -1823,11 +1926,11 @@ async def _run_hover_click(
 
 
 async def _auto_discover(
-    page: Any,
-    request: dict[str, Any],
+    page: BrowserUsePage,
+    request: dict[str, object],
     approved_hostname: str,
     failures: list[dict[str, str]],
-    interactions: list[dict[str, Any]],
+    interactions: list[dict[str, object]],
 ) -> None:
     selector = "nav a,nav button,[role='button'],button,summary,[aria-expanded],[aria-haspopup],.dropdown-toggle,.accordion-toggle,.menu-toggle"
     try:
@@ -1850,12 +1953,12 @@ async def _auto_discover(
 
 
 async def _scroll_page(
-    page: Any,
-    request: dict[str, Any],
+    page: BrowserUsePage,
+    request: dict[str, object],
     approved_hostname: str,
-    consent_recheck: Callable[[], Any] | None = None,
+    consent_recheck: Callable[[], Awaitable[object]] | None = None,
     cdp: CDPSocket | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[dict[str, object], list[dict[str, object]]]:
     evidence: dict[str, Any] = {
         "requested": request["scroll"], "completed": not request["scroll"],
         "requestedDistance": request["scroll_distance"], "measuredDistance": None,
@@ -1995,7 +2098,7 @@ async def _browser_runtime_versions(browser_version: str) -> dict[str, str]:
     }
 
 
-async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
+async def run_capture(request: dict[str, object]) -> dict[str, object]:
     run_id = request["run_id"]
     output_dir: Path = request["output_dir"]
     name = request["name"]
@@ -2222,7 +2325,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
             if request["auto_discover"]:
                 await _auto_discover(page, request, domain["hostname"], failures, interactions)
             await _mark_phase(page, phases, "auto-discover")
-            async def recheck_consent_after_scroll() -> dict[str, Any]:
+            async def recheck_consent_after_scroll() -> dict[str, object]:
                 return await asyncio.wait_for(
                     handle_consent(page, request, "after-scroll-step"),
                     timeout=max(3, request["consent_budget_ms"] / 1000 + 2),
@@ -2379,7 +2482,7 @@ async def run_capture(request: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _result_for_bad_input(error: BaseException, payload: Any = None) -> dict[str, Any]:
+def _result_for_bad_input(error: BaseException, payload: object = None) -> dict[str, object]:
     run_id = None
     if isinstance(payload, dict):
         try:
@@ -2389,7 +2492,7 @@ def _result_for_bad_input(error: BaseException, payload: Any = None) -> dict[str
     return _worker_result("blocked", run_id, reason_code="capture-input-invalid", message=str(error))
 
 
-async def _main_async() -> dict[str, Any]:
+async def _main_async() -> dict[str, object]:
     raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
     if len(raw) > MAX_REQUEST_BYTES:
         return _worker_result("blocked", None, reason_code="capture-input-too-large", message="Input exceeds the size limit")

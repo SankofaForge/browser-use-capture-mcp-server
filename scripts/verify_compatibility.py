@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
+import inspect
 import json
 import os
 import signal
@@ -11,10 +12,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Coroutine
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Protocol
 from urllib.parse import urlparse
 
 
@@ -56,6 +57,44 @@ JANK_OBSERVER = """
   }
 })();
 """
+
+
+class BrowserProfile(Protocol):
+    def get_args(self) -> object: ...
+
+
+class BrowserUsePageCommands(Protocol):
+    async def addScriptToEvaluateOnNewDocument(
+        self, *, params: dict[str, object], session_id: str
+    ) -> object: ...
+
+
+class BrowserUseEmulationCommands(Protocol):
+    async def setEmulatedMedia(
+        self, *, params: dict[str, object], session_id: str
+    ) -> object: ...
+
+
+class BrowserUseCommandCollection(Protocol):
+    Page: BrowserUsePageCommands
+    Emulation: BrowserUseEmulationCommands
+
+
+class BrowserUseCdpClient(Protocol):
+    send: BrowserUseCommandCollection
+
+
+class BrowserUsePage(Protocol):
+    _client: BrowserUseCdpClient
+    session_id: Awaitable[str]
+
+    async def evaluate(self, expression: str) -> object: ...
+
+    async def goto(self, url: str) -> object: ...
+
+    async def set_viewport_size(self, width: int, height: int) -> object: ...
+
+    async def get_target_info(self) -> dict[str, object]: ...
 
 
 def _browser_use_version() -> str:
@@ -106,7 +145,7 @@ def _gpu_status(renderer: str | None) -> dict[str, str]:
 
 async def _launch_browser(
     browser_path: Path,
-    profile: Any,
+    profile: BrowserProfile,
     port: int,
     profile_dir: Path,
 ) -> tuple[asyncio.subprocess.Process, str, str]:
@@ -140,14 +179,17 @@ async def _stop_process(process: asyncio.subprocess.Process | None) -> str:
     return "terminated"
 
 
-async def _kill_session(session: Any) -> None:
+async def _kill_session(session: object) -> None:
     kill = getattr(session, "kill", None)
     if not callable(kill):
         raise RuntimeError("BrowserSession.kill() is unavailable")
-    await asyncio.wait_for(kill(), timeout=5)
+    cleanup = kill()
+    if not inspect.isawaitable(cleanup):
+        raise RuntimeError("BrowserSession.kill() did not return an awaitable")
+    await asyncio.wait_for(cleanup, timeout=5)
 
 
-async def _await_cleanup(cleanup: Coroutine[Any, Any, None]) -> None:
+async def _await_cleanup(cleanup: Coroutine[object, object, None]) -> None:
     cleanup_task = asyncio.create_task(cleanup)
     cancellation_received = False
     while not cleanup_task.done():
@@ -162,17 +204,19 @@ async def _await_cleanup(cleanup: Coroutine[Any, Any, None]) -> None:
         raise asyncio.CancelledError
 
 
-async def _page_cdp_transport(page: Any) -> tuple[Any, str]:
-    client = getattr(page, "_client", None)
+async def _page_cdp_transport(page: BrowserUsePage) -> tuple[BrowserUseCdpClient, str]:
+    client = page._client
     if client is None:
         raise RuntimeError("Browser Use page CDP client is unavailable")
     session_id = await page.session_id
+    if not isinstance(session_id, str) or not session_id:
+        raise RuntimeError("Browser Use page CDP session ID is unavailable")
     return client, session_id
 
 
 async def _record_browser_use_video(
     port: int,
-    page: Any,
+    page: BrowserUsePage,
     output_path: Path,
     width: int,
     height: int,
@@ -192,7 +236,7 @@ async def _record_browser_use_video(
             await cdp.close()
 
 
-async def _install_jank_observer(session: Any, page: Any) -> None:
+async def _install_jank_observer(page: BrowserUsePage) -> None:
     client, session_id = await _page_cdp_transport(page)
     await client.send.Page.addScriptToEvaluateOnNewDocument(
         params={"source": JANK_OBSERVER},
@@ -200,7 +244,7 @@ async def _install_jank_observer(session: Any, page: Any) -> None:
     )
 
 
-async def _set_reduced_motion(session: Any, page: Any, enabled: bool) -> None:
+async def _set_reduced_motion(page: BrowserUsePage, enabled: bool) -> None:
     client, session_id = await _page_cdp_transport(page)
     await client.send.Emulation.setEmulatedMedia(
         params={
@@ -215,7 +259,7 @@ async def _set_reduced_motion(session: Any, page: Any, enabled: bool) -> None:
     )
 
 
-async def _evaluate_json(page: Any, expression: str) -> Any:
+async def _evaluate_json(page: BrowserUsePage, expression: str) -> object:
     value = await page.evaluate(expression)
     if isinstance(value, str):
         if value == "True":
@@ -227,7 +271,7 @@ async def _evaluate_json(page: Any, expression: str) -> Any:
     return value
 
 
-async def _probe_page(page: Any, session: Any) -> tuple[str, str | None, bool, list[dict[str, Any]]]:
+async def _probe_page(page: BrowserUsePage) -> tuple[str, str | None, bool, list[dict[str, object]]]:
     try:
         await page.goto(PROBE_URL)
         title = ""
@@ -247,7 +291,7 @@ async def _probe_page(page: Any, session: Any) -> tuple[str, str | None, bool, l
     mobile_width = await _evaluate_json(page, "() => window.innerWidth")
     if not isinstance(mobile_width, int) or mobile_width > 390:
         raise RuntimeError("mobile viewport probe failed")
-    await _set_reduced_motion(session, page, True)
+    await _set_reduced_motion(page, True)
     reduced_motion = await _evaluate_json(page,
         "() => window.matchMedia('(prefers-reduced-motion: reduce)').matches"
     )
@@ -273,9 +317,12 @@ async def _probe_page(page: Any, session: Any) -> tuple[str, str | None, bool, l
     )
     if not isinstance(jank, dict) or jank.get("observerError"):
         raise RuntimeError("jank observer was unavailable")
+    entries = jank.get("entries", [])
+    if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+        raise RuntimeError("jank observer returned invalid entries")
     if _allowed_url("https://example.org", ["example.com"]):
         raise RuntimeError("domain restriction allowed example.org")
-    return title, renderer if isinstance(renderer, str) else None, True, jank.get("entries", [])
+    return title, renderer if isinstance(renderer, str) else None, True, entries
 
 
 async def verify() -> dict[str, object]:
@@ -318,8 +365,8 @@ async def verify() -> dict[str, object]:
             page = await session.get_current_page()
             if page is None:
                 raise RuntimeError("BrowserSession returned no current page")
-            await _install_jank_observer(session, page)
-            _, renderer, domain_restriction, jank_entries = await _probe_page(page, session)
+            await _install_jank_observer(page)
+            _, renderer, domain_restriction, jank_entries = await _probe_page(page)
             await page.set_viewport_size(640, 480)
             await _record_browser_use_video(port, page, recording_path, 640, 480)
             await _kill_session(session)
