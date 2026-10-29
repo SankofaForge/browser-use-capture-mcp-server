@@ -8,7 +8,6 @@ version = "0.1.0"
 description = "Fail-closed Browser Use capture adapter for the design-inspiration workflow"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-  "aiohttp>=3.9,<4",
   "browser-use[video]==0.13.11",
   "mcp==2.1.1",
 ]
